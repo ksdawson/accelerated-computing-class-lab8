@@ -123,9 +123,9 @@ __device__ void thread_level_render_helper(
     // Might be faster + simpler to just iterate over tile pixels?
     // Get intersection of circle and thread subtile pixels
     const int32_t start_inter_i = max(int32_t(c_y - c_radius), (int32_t)start_i);
-    const int32_t end_inter_i = min(int32_t(c_y + c_radius + 1.0f), (int32_t)end_i);
+    const int32_t end_inter_i = min(int32_t(c_y + c_radius + 1.0f), (int32_t)end_i - 1);
     const int32_t start_inter_j = max(int32_t(c_x - c_radius), (int32_t)start_j);
-    const int32_t end_inter_j = min(int32_t(c_x + c_radius + 1.0f), (int32_t)end_j);
+    const int32_t end_inter_j = min(int32_t(c_x + c_radius + 1.0f), (int32_t)end_j - 1);
 
     // Iterate over relevant pixels
     for (int32_t i = start_inter_i; i <= end_inter_i; ++i) {
