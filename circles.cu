@@ -117,28 +117,28 @@ template <uint32_t T_TH, uint32_t T_TW>
 __device__ void thread_level_render_helper(
     const float c_x, const float c_y, const float c_radius,
     const float c_red, const float c_green, const float c_blue, const float c_alpha,
-    const uint32_t start_x, const uint32_t start_y, const uint32_t end_x, const uint32_t end_y,
+    const uint32_t start_i, const uint32_t start_j, const uint32_t end_i, const uint32_t end_j,
     float *thread_img_red, float *thread_img_green, float *thread_img_blue
 ) {
     // Might be faster + simpler to just iterate over tile pixels?
     // Get intersection of circle and thread subtile pixels
-    const uint32_t start_inter_x = max(int32_t(c_x - c_radius), start_x);
-    const uint32_t end_inter_x = min(int32_t(c_x + c_radius + 1.0f), end_x);
-    const uint32_t start_inter_y = max(int32_t(c_y - c_radius), start_y);
-    const uint32_t end_inter_y = min(int32_t(c_y + c_radius + 1.0f), end_y);
+    const uint32_t start_inter_i = max(int32_t(c_y - c_radius), start_i);
+    const uint32_t end_inter_i = min(int32_t(c_y + c_radius + 1.0f), end_i);
+    const uint32_t start_inter_j = max(int32_t(c_x - c_radius), start_j);
+    const uint32_t end_inter_j = min(int32_t(c_x + c_radius + 1.0f), end_j);
 
     // Iterate over relevant pixels
-    for (uint32_t x = start_inter_x; x <= end_inter_x; ++x) {
-        for (uint32_t y = start_inter_y; y <= end_inter_y; ++y) {
+    for (uint32_t i = start_inter_i; i <= end_inter_i; ++i) {
+        for (uint32_t j = start_inter_j; j <= end_inter_j; ++j) {
             // Handle that circle can cover partial pixels
-            float dx = x - c_x;
-            float dy = y - c_y;
+            float dy = i - c_y;
+            float dx = j - c_x;
             if (!(dx * dx + dy * dy < c_radius * c_radius)) {
                 continue;
             }
 
             // Update pixel
-            const uint32_t p = (x - start_x) * T_TW + (y - start_y);
+            const uint32_t p = (i - start_i) * T_TW + (j - start_j);
             thread_img_red[p] = thread_img_red[p] * (1 - c_alpha) + c_red * c_alpha;
             thread_img_green[p] = thread_img_green[p] * (1 - c_alpha) + c_green * c_alpha;
             thread_img_blue[p] = thread_img_blue[p] * (1 - c_alpha) + c_blue * c_alpha;
@@ -151,7 +151,7 @@ __device__ void thread_level_render(
     const uint32_t n_circle,
     float const *circle_x, float const *circle_y, float const *circle_radius,
     float const *circle_red, float const *circle_green, float const *circle_blue, float const *circle_alpha,
-    const uint32_t start_x, const uint32_t start_y, // thread tile coordinates
+    const uint32_t start_i, const uint32_t start_j, // thread tile coordinates
     float *thread_img_red, float *thread_img_green, float *thread_img_blue // thread output img
 ) {
     // Vectorize circle arrays
@@ -164,8 +164,8 @@ __device__ void thread_level_render(
     float4 const *circle_alpha4 = reinterpret_cast<float4 const*>(circle_alpha);
 
     // Tile dimensions
-    const uint32_t end_x = start_x + T_TW;
-    const uint32_t end_y = start_y + T_TH;
+    const uint32_t end_i = start_i + T_TH;
+    const uint32_t end_j = start_j + T_TW;
 
     // Iterate over circles
     for (int32_t vc = 0; vc < n_circle / 4; vc++) {
@@ -182,25 +182,25 @@ __device__ void thread_level_render(
         thread_level_render_helper<T_TH, T_TW>(
             c_x4.x, c_y4.x, c_radius4.x,
             c_red4.x, c_green4.x, c_blue4.x, c_alpha4.x,
-            start_x, start_y, end_x, end_y,
+            start_i, start_j, end_i, end_j,
             thread_img_red, thread_img_green, thread_img_blue
         );
         thread_level_render_helper<T_TH, T_TW>(
             c_x4.y, c_y4.y, c_radius4.y,
             c_red4.y, c_green4.y, c_blue4.y, c_alpha4.y,
-            start_x, start_y, end_x, end_y,
+            start_i, start_j, end_i, end_j,
             thread_img_red, thread_img_green, thread_img_blue
         );
         thread_level_render_helper<T_TH, T_TW>(
             c_x4.z, c_y4.z, c_radius4.z,
             c_red4.z, c_green4.z, c_blue4.z, c_alpha4.z,
-            start_x, start_y, end_x, end_y,
+            start_i, start_j, end_i, end_j,
             thread_img_red, thread_img_green, thread_img_blue
         );
         thread_level_render_helper<T_TH, T_TW>(
             c_x4.w, c_y4.w, c_radius4.w,
             c_red4.w, c_green4.w, c_blue4.w, c_alpha4.w,
-            start_x, start_y, end_x, end_y,
+            start_i, start_j, end_i, end_j,
             thread_img_red, thread_img_green, thread_img_blue
         );
     }
@@ -213,7 +213,7 @@ __device__ void sm_level_render(
     float const *circle_x, float const *circle_y, float const *circle_radius,
     float const *circle_red, float const *circle_green, float const *circle_blue, float const *circle_alpha,
     float *img_red, float *img_green, float *img_blue,
-    const uint32_t smt_start_x, const uint32_t smt_start_y // sm tile coordinates
+    const uint32_t smt_start_i, const uint32_t smt_start_j // sm tile coordinates
 ) {
     // Thread grid dimensions
     constexpr uint32_t tt_per_i = SM_TH / T_TH;
@@ -222,8 +222,8 @@ __device__ void sm_level_render(
     const uint32_t tt_j = threadIdx.x % tt_per_j;
 
     // Move start x, y
-    const uint32_t tt_start_x = smt_start_x + tt_i * T_TH;
-    const uint32_t tt_start_y = smt_start_y + tt_j * T_TW;
+    const uint32_t tt_start_i = smt_start_i + tt_i * T_TH;
+    const uint32_t tt_start_j = smt_start_j + tt_j * T_TW;
 
     // Each thread gets a tile of pixels
     float tt_img_red[T_TH * T_TW] = {1.0f};
@@ -236,7 +236,7 @@ __device__ void sm_level_render(
     thread_level_render<T_TH, T_TW>(n_circle,
         circle_x, circle_y, circle_radius,
         circle_red, circle_green, circle_blue, circle_alpha,
-        tt_start_x, tt_start_y,
+        tt_start_i, tt_start_j,
         tt_img_red, tt_img_green, tt_img_blue
     );
 
@@ -244,12 +244,12 @@ __device__ void sm_level_render(
     #pragma unroll
     for (uint32_t p = 0; p < T_TH * T_TW; ++p) {
         // Convert 1D to 2D indices
-        const uint32_t x = tt_start_x + p / T_TW;
-        const uint32_t y = tt_start_y + p % T_TW;
+        const uint32_t i = tt_start_i + p / T_TW;
+        const uint32_t j = tt_start_j + p % T_TW;
         // Write back
-        img_red[x * width + y] = tt_img_red[p];
-        img_green[x * width + y] = tt_img_green[p];
-        img_blue[x * width + y] = tt_img_blue[p];
+        img_red[i * width + j] = tt_img_red[p];
+        img_green[i * width + j] = tt_img_green[p];
+        img_blue[i * width + j] = tt_img_blue[p];
     }
 }
 
@@ -283,27 +283,6 @@ __global__ void gpu_level_render(
         );
     }
 }
-
-// How do we use that a circle is a bounding box telling you which pixels it touches?
-
-// Simple idea:
-// (1) Divide image into SM tiles
-// (2) Entire grid computes a scan of a boolean array similar to RLE for each tile over circles
-//     (a) 1 indicates a circle is in the tile; 0 if not (use the boundary of the tile to check)
-//     (b) Prefix sum indicates index in output of "runs"
-//     (c) The "start" of a run is the circle that's actually in the tile
-// (3) Now each tile has a list of only relevant circles
-// (4) At this point could simply have each thread handle a pixel and iterate over its tile's circles
-//     (a) Threads should handle pixels because then can accumulate results in registers and no need for atomic ops
-//     (b) Threads should work on tiles so load data for some circles SMEM->reg then use it for all the pixels
-//     (c) Tile's circles are in order but may not fit completely in SMEM, so need to buffer
-// (5) Alt: recursively scan?
-
-// Plan:
-// (1) Use RLE from lab7 to get relevant circles for each SM tile
-// (2) Simple SM-level impl: iterate over pixels and iterate over relevant circles
-// (3) Improve SM-level by thread tiling
-// (4) Improve SM-level by SMEM loading
 
 void launch_render(
     int32_t width,
@@ -339,7 +318,26 @@ void launch_render(
 
 } // namespace circles_gpu
 
-/// <--- /your code here --->
+// How do we use that a circle is a bounding box telling you which pixels it touches?
+
+// Simple idea:
+// (1) Divide image into SM tiles
+// (2) Entire grid computes a scan of a boolean array similar to RLE for each tile over circles
+//     (a) 1 indicates a circle is in the tile; 0 if not (use the boundary of the tile to check)
+//     (b) Prefix sum indicates index in output of "runs"
+//     (c) The "start" of a run is the circle that's actually in the tile
+// (3) Now each tile has a list of only relevant circles
+// (4) At this point could simply have each thread handle a pixel and iterate over its tile's circles
+//     (a) Threads should handle pixels because then can accumulate results in registers and no need for atomic ops
+//     (b) Threads should work on tiles so load data for some circles SMEM->reg then use it for all the pixels
+//     (c) Tile's circles are in order but may not fit completely in SMEM, so need to buffer
+// (5) Alt: recursively scan?
+
+// Plan:
+// (1) Use RLE from lab7 to get relevant circles for each SM tile
+// (2) Simple SM-level impl: iterate over pixels and iterate over relevant circles
+// (3) Improve SM-level by thread tiling
+// (4) Improve SM-level by SMEM loading
 
 ////////////////////////////////////////////////////////////////////////////////
 ///          YOU DO NOT NEED TO MODIFY THE CODE BELOW HERE.                  ///
