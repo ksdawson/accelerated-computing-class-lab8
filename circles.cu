@@ -113,7 +113,155 @@ void render_cpu(
 
 namespace circles_gpu {
 
-/* TODO: your GPU kernels here... */
+template <uint32_t T_TH, uint32_t T_TW>
+__device__ void thread_level_render(
+    const uint32_t n_circle,
+    float const *circle_x, float const *circle_y, float const *circle_radius,
+    float const *circle_red, float const *circle_green, float const *circle_blue, float const *circle_alpha,
+    const uint32_t start_x, const uint32_t start_y, // thread tile coordinates
+    float *thread_img_red, float *thread_img_green, float *thread_img_blue, // thread output img
+) {
+    // Vectorize circle arrays
+    float4 const *circle_x4 = reinterpret_cast<float4 const*>(circle_x);
+    float4 const *circle_y4 = reinterpret_cast<float4 const*>(circle_y);
+    float4 const *circle_radius4 = reinterpret_cast<float4 const*>(circle_radius);
+    float4 const *circle_red4 = reinterpret_cast<float4 const*>(circle_red);
+    float4 const *circle_green4 = reinterpret_cast<float4 const*>(circle_green);
+    float4 const *circle_blue4 = reinterpret_cast<float4 const*>(circle_blue);
+    float4 const *circle_alpha4 = reinterpret_cast<float4 const*>(circle_alpha);
+
+    // Iterate over circles
+    for (int32_t vc = 0; vc < n_circle / 4; vc++) {
+        // Vector load 4 circles
+        const float4 c_x4 = circle_x4[vc];
+        const float4 c_y4 = circle_y4[vc];
+        const float4 c_radius4 = circle_radius4[vc];
+        const float4 c_red4 = circle_red4[vc];
+        const float4 c_green4 = circle_green4[vc];
+        const float4 c_blue4 = circle_blue4[vc];
+        const float4 c_alpha4 = circle_alpha4[vc];
+
+        // Tile dimensions
+        const uint32_t end_x = start_x + T_TW;
+        const uint32_t end_y = start_y + T_TH;
+
+        // Iterate over 4 circles
+        #pragma unroll
+        for (uint32_t c = 0; c < 4; ++c) {
+            // Get scalar circle
+            const float c_x = c_x4.elements[c];
+            const float c_y = c_y4.elements[c];
+            const float c_radius = c_radius4.elements[c];
+            const float c_red = c_red4.elements[c];
+            const float c_green = c_green4.elements[c];
+            const float c_blue = c_blue4.elements[c];
+            const float c_alpha = c_alpha4.elements[c];
+
+            // Might be faster + simpler to just iterate over tile pixels?
+            // Get intersection of circle and thread subtile pixels
+            const uint32_t start_inter_x = max(int32_t(c_x - c_radius), start_x);
+            const uint32_t end_inter_x = min(int32_t(c_x + c_radius + 1.0f), end_x);
+            const uint32_t start_inter_y = max(int32_t(c_y - c_radius), start_y);
+            const uint32_t end_inter_y = min(int32_t(c_y + c_radius + 1.0f), end_y);
+
+            // Iterate over relevant pixels
+            for (uint32_t x = start_inter_x; x <= end_inter_x; ++x) {
+                for (uint32_t y = start_inter_y; y <= end_inter_y; ++y) {
+                    // Handle that circle can cover partial pixels
+                    float dx = x - c_x;
+                    float dy = y - c_y;
+                    if (!(dx * dx + dy * dy < c_radius * c_radius)) {
+                        continue;
+                    }
+
+                    // Update pixel
+                    const uint32_t p = (x - start_x) * T_TW + (y - start_y);
+                    thread_img_red[p] = thread_img_red[p] * (1 - c_alpha) + c_red * c_alpha;
+                    thread_img_green[p] = thread_img_green[p] * (1 - c_alpha) + c_green * c_alpha;
+                    thread_img_blue[p] = thread_img_blue[p] * (1 - c_alpha) + c_blue * c_alpha;
+                }
+            }
+        }
+    }
+}
+
+template <uint32_t SM_TH, uint32_t SM_TW, uint32_t T_TH, uint32_t T_TW>
+__device__ void sm_level_render(
+    const uint32_t width, const uint32_t height,
+    const uint32_t n_circle,
+    float const *circle_x, float const *circle_y, float const *circle_radius,
+    float const *circle_red, float const *circle_green, float const *circle_blue, float const *circle_alpha,
+    float *img_red, float *img_green, float *img_blue,
+    const uint32_t smt_start_x, const uint32_t smt_start_y, // sm tile coordinates
+) {
+    // Thread grid dimensions
+    constexpr uint32_t tt_per_i = SM_TH / T_TH;
+    constexpr uint32_t tt_per_j = SM_TW / T_TW;
+    const uint32_t tt_i = threadIdx.x / tt_per_j;
+    const uint32_t tt_j = threadIdx.x % tt_per_j;
+
+    // Move start x, y
+    const uint32_t tt_start_x = smt_start_x + tt_i * T_TH;
+    const uint32_t tt_start_y = smt_start_y + tt_j * T_TW;
+
+    // Each thread gets a tile of pixels
+    float tt_img_red[T_TH * T_TW] = {1.0f};
+    float tt_img_green[T_TH * T_TW] = {1.0f};
+    float tt_img_blue[T_TH * T_TW] = {1.0f};
+
+    // TODO: Add SMEM and double buffering
+
+    // Process tile
+    thread_level_render<T_TH, T_TW>(n_circle,
+        circle_x, circle_y, circle_radius,
+        circle_red, circle_green, circle_blue, circle_alpha,
+        tt_start_x, tt_start_y,
+        tt_img_red, tt_img_green, tt_img_blue,
+    );
+
+    // Write back to main memory at the end
+    #pragma unroll
+    for (uint32_t p = 0; p < T_TH * T_TW; ++p) {
+        // Convert 1D to 2D indices
+        const uint32_t x = tt_start_x + p / T_TW;
+        const uint32_t y = tt_start_y + p % T_TW;
+        // Write back
+        img_red[x * width + y] = tt_img_red[p];
+        img_green[x * width + y] = tt_img_green[p];
+        img_blue[x * width + y] = tt_img_blue[p];
+    }
+}
+
+template <
+    uint32_t SM_TH, uint32_t SM_TW, // SM tile size
+    uint32_t T_TH, uint32_t T_TW // Thread tile size
+>
+__global__ void gpu_level_render(
+    uint32_t width, uint32_t height, // img size
+    uint32_t n_circle, // num circles
+    float const *circle_x, float const *circle_y, float const *circle_radius, // circle size arrays
+    float const *circle_red, float const *circle_green, float const *circle_blue, float const *circle_alpha, // circle color arrays
+    float *img_red, float *img_green, float *img_blue // output img
+) {
+    // SM grid dimensions
+    const uint32_t smt_per_i = height / SM_TH;
+    const uint32_t smt_per_j = width / SM_TW;
+
+    // Iterate over SM tiles
+    for (uint32_t sm_idx = blockIdx.x; sm_idx < smt_per_i * smt_per_j; sm_idx += gridDim.x) {
+        // SM tile indices
+        const uint32_t smt_i = sm_idx / smt_per_j;
+        const uint32_t smt_j = sm_idx % smt_per_j;
+
+        // Process tile
+        sm_level_render<SM_TH, SM_TW, T_TH, T_TW>(width, height, n_circle,
+            circle_x, circle_y, circle_radius,
+            circle_red, circle_green, circle_blue, circle_alpha,
+            img_red, img_green, img_blue,
+            smt_i * SM_TH, smt_j * SM_TW,
+        );
+    }
+}
 
 // How do we use that a circle is a bounding box telling you which pixels it touches?
 
@@ -151,7 +299,21 @@ void launch_render(
     float *img_green,           // pointer to GPU memory
     float *img_blue,            // pointer to GPU memory
     GpuMemoryPool &memory_pool) {
-    /* TODO: your CPU code here... */
+    // Test case sizes: 256x256, 1024x1024
+    if (height == 256 && width == 256) {
+        gpu_level_render<32, 32, 2, 2><<<48, 8*32>>>(width, height, n_circle, circle_x, circle_y, circle_radius,
+            circle_red, circle_green, circle_blue, circle_alpha,
+            img_red, img_green, img_blue
+        );
+    } else if (height == 1024 && width == 1024) {
+        gpu_level_render<128, 128, 8, 8><<<48, 8*32>>>(width, height, n_circle, circle_x, circle_y, circle_radius,
+            circle_red, circle_green, circle_blue, circle_alpha,
+            img_red, img_green, img_blue
+        );
+    } else {
+        // Not handled
+        return;
+    }
 }
 
 } // namespace circles_gpu
