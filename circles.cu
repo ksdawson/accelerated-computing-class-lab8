@@ -122,26 +122,26 @@ __device__ void thread_level_render_helper(
 ) {
     // Might be faster + simpler to just iterate over tile pixels?
     // Get intersection of circle and thread subtile pixels
-    const uint32_t start_inter_i = max(int32_t(c_y - c_radius), start_i);
-    const uint32_t end_inter_i = min(int32_t(c_y + c_radius + 1.0f), end_i);
-    const uint32_t start_inter_j = max(int32_t(c_x - c_radius), start_j);
-    const uint32_t end_inter_j = min(int32_t(c_x + c_radius + 1.0f), end_j);
+    const int32_t start_inter_i = max(int32_t(c_y - c_radius), (int32_t)start_i);
+    const int32_t end_inter_i = min(int32_t(c_y + c_radius + 1.0f), (int32_t)end_i);
+    const int32_t start_inter_j = max(int32_t(c_x - c_radius), (int32_t)start_j);
+    const int32_t end_inter_j = min(int32_t(c_x + c_radius + 1.0f), (int32_t)end_j);
 
     // Iterate over relevant pixels
-    for (uint32_t i = start_inter_i; i <= end_inter_i; ++i) {
-        for (uint32_t j = start_inter_j; j <= end_inter_j; ++j) {
+    for (int32_t i = start_inter_i; i <= end_inter_i; ++i) {
+        for (int32_t j = start_inter_j; j <= end_inter_j; ++j) {
             // Handle that circle can cover partial pixels
-            float dy = i - c_y;
-            float dx = j - c_x;
+            const float dy = i - c_y;
+            const float dx = j - c_x;
             if (!(dx * dx + dy * dy < c_radius * c_radius)) {
                 continue;
             }
 
             // Update pixel
-            const uint32_t p = (i - start_i) * T_TW + (j - start_j);
-            thread_img_red[p] = thread_img_red[p] * (1 - c_alpha) + c_red * c_alpha;
-            thread_img_green[p] = thread_img_green[p] * (1 - c_alpha) + c_green * c_alpha;
-            thread_img_blue[p] = thread_img_blue[p] * (1 - c_alpha) + c_blue * c_alpha;
+            const int32_t p = (i - start_i) * T_TW + (j - start_j);
+            thread_img_red[p] = thread_img_red[p] * (1.0f - c_alpha) + c_red * c_alpha;
+            thread_img_green[p] = thread_img_green[p] * (1.0f - c_alpha) + c_green * c_alpha;
+            thread_img_blue[p] = thread_img_blue[p] * (1.0f - c_alpha) + c_blue * c_alpha;
         }
     }
 }
