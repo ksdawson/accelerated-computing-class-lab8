@@ -226,30 +226,77 @@ __device__ void sm_level_render(
     const uint32_t tt_start_j = smt_start_j + tt_j * T_TW;
 
     // Each thread gets a tile of pixels
-    float tt_img_red[T_TH * T_TW] = {1.0f};
-    float tt_img_green[T_TH * T_TW] = {1.0f};
-    float tt_img_blue[T_TH * T_TW] = {1.0f};
+    if constexpr (T_TH * T_TW == 4) {
+        float tt_img_red[4] = {1.0f, 1.0f, 1.0f, 1.0f};
+        float tt_img_green[4] = {1.0f, 1.0f, 1.0f, 1.0f};
+        float tt_img_blue[4] = {1.0f, 1.0f, 1.0f, 1.0f};
 
-    // TODO: Add SMEM and double buffering
+        // Process tile
+        thread_level_render<T_TH, T_TW>(n_circle,
+            circle_x, circle_y, circle_radius,
+            circle_red, circle_green, circle_blue, circle_alpha,
+            tt_start_i, tt_start_j,
+            tt_img_red, tt_img_green, tt_img_blue
+        );
 
-    // Process tile
-    thread_level_render<T_TH, T_TW>(n_circle,
-        circle_x, circle_y, circle_radius,
-        circle_red, circle_green, circle_blue, circle_alpha,
-        tt_start_i, tt_start_j,
-        tt_img_red, tt_img_green, tt_img_blue
-    );
-
-    // Write back to main memory at the end
-    #pragma unroll
-    for (uint32_t p = 0; p < T_TH * T_TW; ++p) {
-        // Convert 1D to 2D indices
-        const uint32_t i = tt_start_i + p / T_TW;
-        const uint32_t j = tt_start_j + p % T_TW;
-        // Write back
-        img_red[i * width + j] = tt_img_red[p];
-        img_green[i * width + j] = tt_img_green[p];
-        img_blue[i * width + j] = tt_img_blue[p];
+        // Write back to main memory at the end
+        #pragma unroll
+        for (uint32_t p = 0; p < T_TH * T_TW; ++p) {
+            // Convert 1D to 2D indices
+            const uint32_t i = tt_start_i + p / T_TW;
+            const uint32_t j = tt_start_j + p % T_TW;
+            // Write back
+            img_red[i * width + j] = tt_img_red[p];
+            img_green[i * width + j] = tt_img_green[p];
+            img_blue[i * width + j] = tt_img_blue[p];
+        }
+    } else if constexpr (T_TH * T_TW == 64) {
+        float tt_img_red[64] = {
+            1.0f, 1.0f, 1.0f, 1.0f, 1.0f, 1.0f, 1.0f, 1.0f, 
+            1.0f, 1.0f, 1.0f, 1.0f, 1.0f, 1.0f, 1.0f, 1.0f, 
+            1.0f, 1.0f, 1.0f, 1.0f, 1.0f, 1.0f, 1.0f, 1.0f, 
+            1.0f, 1.0f, 1.0f, 1.0f, 1.0f, 1.0f, 1.0f, 1.0f, 
+            1.0f, 1.0f, 1.0f, 1.0f, 1.0f, 1.0f, 1.0f, 1.0f, 
+            1.0f, 1.0f, 1.0f, 1.0f, 1.0f, 1.0f, 1.0f, 1.0f, 
+            1.0f, 1.0f, 1.0f, 1.0f, 1.0f, 1.0f, 1.0f, 1.0f, 
+            1.0f, 1.0f, 1.0f, 1.0f, 1.0f, 1.0f, 1.0f, 1.0f
+        };
+        float tt_img_green[64] = {
+            1.0f, 1.0f, 1.0f, 1.0f, 1.0f, 1.0f, 1.0f, 1.0f, 
+            1.0f, 1.0f, 1.0f, 1.0f, 1.0f, 1.0f, 1.0f, 1.0f, 
+            1.0f, 1.0f, 1.0f, 1.0f, 1.0f, 1.0f, 1.0f, 1.0f, 
+            1.0f, 1.0f, 1.0f, 1.0f, 1.0f, 1.0f, 1.0f, 1.0f, 
+            1.0f, 1.0f, 1.0f, 1.0f, 1.0f, 1.0f, 1.0f, 1.0f, 
+            1.0f, 1.0f, 1.0f, 1.0f, 1.0f, 1.0f, 1.0f, 1.0f, 
+            1.0f, 1.0f, 1.0f, 1.0f, 1.0f, 1.0f, 1.0f, 1.0f, 
+            1.0f, 1.0f, 1.0f, 1.0f, 1.0f, 1.0f, 1.0f, 1.0f
+        };
+        float tt_img_blue[64] = {
+            1.0f, 1.0f, 1.0f, 1.0f, 1.0f, 1.0f, 1.0f, 1.0f, 
+            1.0f, 1.0f, 1.0f, 1.0f, 1.0f, 1.0f, 1.0f, 1.0f, 
+            1.0f, 1.0f, 1.0f, 1.0f, 1.0f, 1.0f, 1.0f, 1.0f, 
+            1.0f, 1.0f, 1.0f, 1.0f, 1.0f, 1.0f, 1.0f, 1.0f, 
+            1.0f, 1.0f, 1.0f, 1.0f, 1.0f, 1.0f, 1.0f, 1.0f, 
+            1.0f, 1.0f, 1.0f, 1.0f, 1.0f, 1.0f, 1.0f, 1.0f, 
+            1.0f, 1.0f, 1.0f, 1.0f, 1.0f, 1.0f, 1.0f, 1.0f, 
+            1.0f, 1.0f, 1.0f, 1.0f, 1.0f, 1.0f, 1.0f, 1.0f
+        };
+        thread_level_render<T_TH, T_TW>(n_circle,
+            circle_x, circle_y, circle_radius,
+            circle_red, circle_green, circle_blue, circle_alpha,
+            tt_start_i, tt_start_j,
+            tt_img_red, tt_img_green, tt_img_blue
+        );
+        #pragma unroll
+        for (uint32_t p = 0; p < T_TH * T_TW; ++p) {
+            const uint32_t i = tt_start_i + p / T_TW;
+            const uint32_t j = tt_start_j + p % T_TW;
+            img_red[i * width + j] = tt_img_red[p];
+            img_green[i * width + j] = tt_img_green[p];
+            img_blue[i * width + j] = tt_img_blue[p];
+        }
+    } else {
+        return;
     }
 }
 
