@@ -114,12 +114,45 @@ void render_cpu(
 namespace circles_gpu {
 
 template <uint32_t T_TH, uint32_t T_TW>
+__device__ void thread_level_render_helper(
+    const float c_x, const float c_y, const float c_radius,
+    const float c_red, const float c_green, const float c_blue, const float c_alpha,
+    const uint32_t start_x, const uint32_t start_y, const uint32_t end_x, const uint32_t end_y,
+    float *thread_img_red, float *thread_img_green, float *thread_img_blue
+) {
+    // Might be faster + simpler to just iterate over tile pixels?
+    // Get intersection of circle and thread subtile pixels
+    const uint32_t start_inter_x = max(int32_t(c_x - c_radius), start_x);
+    const uint32_t end_inter_x = min(int32_t(c_x + c_radius + 1.0f), end_x);
+    const uint32_t start_inter_y = max(int32_t(c_y - c_radius), start_y);
+    const uint32_t end_inter_y = min(int32_t(c_y + c_radius + 1.0f), end_y);
+
+    // Iterate over relevant pixels
+    for (uint32_t x = start_inter_x; x <= end_inter_x; ++x) {
+        for (uint32_t y = start_inter_y; y <= end_inter_y; ++y) {
+            // Handle that circle can cover partial pixels
+            float dx = x - c_x;
+            float dy = y - c_y;
+            if (!(dx * dx + dy * dy < c_radius * c_radius)) {
+                continue;
+            }
+
+            // Update pixel
+            const uint32_t p = (x - start_x) * T_TW + (y - start_y);
+            thread_img_red[p] = thread_img_red[p] * (1 - c_alpha) + c_red * c_alpha;
+            thread_img_green[p] = thread_img_green[p] * (1 - c_alpha) + c_green * c_alpha;
+            thread_img_blue[p] = thread_img_blue[p] * (1 - c_alpha) + c_blue * c_alpha;
+        }
+    }
+}
+
+template <uint32_t T_TH, uint32_t T_TW>
 __device__ void thread_level_render(
     const uint32_t n_circle,
     float const *circle_x, float const *circle_y, float const *circle_radius,
     float const *circle_red, float const *circle_green, float const *circle_blue, float const *circle_alpha,
     const uint32_t start_x, const uint32_t start_y, // thread tile coordinates
-    float *thread_img_red, float *thread_img_green, float *thread_img_blue, // thread output img
+    float *thread_img_red, float *thread_img_green, float *thread_img_blue // thread output img
 ) {
     // Vectorize circle arrays
     float4 const *circle_x4 = reinterpret_cast<float4 const*>(circle_x);
@@ -129,6 +162,10 @@ __device__ void thread_level_render(
     float4 const *circle_green4 = reinterpret_cast<float4 const*>(circle_green);
     float4 const *circle_blue4 = reinterpret_cast<float4 const*>(circle_blue);
     float4 const *circle_alpha4 = reinterpret_cast<float4 const*>(circle_alpha);
+
+    // Tile dimensions
+    const uint32_t end_x = start_x + T_TW;
+    const uint32_t end_y = start_y + T_TH;
 
     // Iterate over circles
     for (int32_t vc = 0; vc < n_circle / 4; vc++) {
@@ -141,47 +178,31 @@ __device__ void thread_level_render(
         const float4 c_blue4 = circle_blue4[vc];
         const float4 c_alpha4 = circle_alpha4[vc];
 
-        // Tile dimensions
-        const uint32_t end_x = start_x + T_TW;
-        const uint32_t end_y = start_y + T_TH;
-
-        // Iterate over 4 circles
-        #pragma unroll
-        for (uint32_t c = 0; c < 4; ++c) {
-            // Get scalar circle
-            const float c_x = c_x4.elements[c];
-            const float c_y = c_y4.elements[c];
-            const float c_radius = c_radius4.elements[c];
-            const float c_red = c_red4.elements[c];
-            const float c_green = c_green4.elements[c];
-            const float c_blue = c_blue4.elements[c];
-            const float c_alpha = c_alpha4.elements[c];
-
-            // Might be faster + simpler to just iterate over tile pixels?
-            // Get intersection of circle and thread subtile pixels
-            const uint32_t start_inter_x = max(int32_t(c_x - c_radius), start_x);
-            const uint32_t end_inter_x = min(int32_t(c_x + c_radius + 1.0f), end_x);
-            const uint32_t start_inter_y = max(int32_t(c_y - c_radius), start_y);
-            const uint32_t end_inter_y = min(int32_t(c_y + c_radius + 1.0f), end_y);
-
-            // Iterate over relevant pixels
-            for (uint32_t x = start_inter_x; x <= end_inter_x; ++x) {
-                for (uint32_t y = start_inter_y; y <= end_inter_y; ++y) {
-                    // Handle that circle can cover partial pixels
-                    float dx = x - c_x;
-                    float dy = y - c_y;
-                    if (!(dx * dx + dy * dy < c_radius * c_radius)) {
-                        continue;
-                    }
-
-                    // Update pixel
-                    const uint32_t p = (x - start_x) * T_TW + (y - start_y);
-                    thread_img_red[p] = thread_img_red[p] * (1 - c_alpha) + c_red * c_alpha;
-                    thread_img_green[p] = thread_img_green[p] * (1 - c_alpha) + c_green * c_alpha;
-                    thread_img_blue[p] = thread_img_blue[p] * (1 - c_alpha) + c_blue * c_alpha;
-                }
-            }
-        }
+        // Process all 4 circles
+        thread_level_render_helper<T_TH, T_TW>(
+            c_x4.x, c_y4.x, c_radius4.x,
+            c_red4.x, c_green4.x, c_blue4.x, c_alpha4.x,
+            start_x, start_y, end_x, end_y,
+            thread_img_red, thread_img_green, thread_img_blue
+        );
+        thread_level_render_helper<T_TH, T_TW>(
+            c_x4.y, c_y4.y, c_radius4.y,
+            c_red4.y, c_green4.y, c_blue4.y, c_alpha4.y,
+            start_x, start_y, end_x, end_y,
+            thread_img_red, thread_img_green, thread_img_blue
+        );
+        thread_level_render_helper<T_TH, T_TW>(
+            c_x4.z, c_y4.z, c_radius4.z,
+            c_red4.z, c_green4.z, c_blue4.z, c_alpha4.z,
+            start_x, start_y, end_x, end_y,
+            thread_img_red, thread_img_green, thread_img_blue
+        );
+        thread_level_render_helper<T_TH, T_TW>(
+            c_x4.w, c_y4.w, c_radius4.w,
+            c_red4.w, c_green4.w, c_blue4.w, c_alpha4.w,
+            start_x, start_y, end_x, end_y,
+            thread_img_red, thread_img_green, thread_img_blue
+        );
     }
 }
 
@@ -192,7 +213,7 @@ __device__ void sm_level_render(
     float const *circle_x, float const *circle_y, float const *circle_radius,
     float const *circle_red, float const *circle_green, float const *circle_blue, float const *circle_alpha,
     float *img_red, float *img_green, float *img_blue,
-    const uint32_t smt_start_x, const uint32_t smt_start_y, // sm tile coordinates
+    const uint32_t smt_start_x, const uint32_t smt_start_y // sm tile coordinates
 ) {
     // Thread grid dimensions
     constexpr uint32_t tt_per_i = SM_TH / T_TH;
@@ -216,7 +237,7 @@ __device__ void sm_level_render(
         circle_x, circle_y, circle_radius,
         circle_red, circle_green, circle_blue, circle_alpha,
         tt_start_x, tt_start_y,
-        tt_img_red, tt_img_green, tt_img_blue,
+        tt_img_red, tt_img_green, tt_img_blue
     );
 
     // Write back to main memory at the end
@@ -258,7 +279,7 @@ __global__ void gpu_level_render(
             circle_x, circle_y, circle_radius,
             circle_red, circle_green, circle_blue, circle_alpha,
             img_red, img_green, img_blue,
-            smt_i * SM_TH, smt_j * SM_TW,
+            smt_i * SM_TH, smt_j * SM_TW
         );
     }
 }
