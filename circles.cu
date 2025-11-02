@@ -500,7 +500,7 @@ void launch_render(
             img_red, img_green, img_blue
         );
     } else if (height == 1024 && width == 1024) {
-        constexpr uint32_t num_circles = 1000; // Tuning parameter
+        constexpr uint32_t num_circles = 2000; // Tuning parameter
         constexpr int smem_size_bytes = num_circles * 7 * sizeof(float); // 7 float arrays
         cudaFuncSetAttribute(
             gpu_level_render<128, 128, 8, 8, num_circles>,
