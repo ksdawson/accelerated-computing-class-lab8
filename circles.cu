@@ -4,6 +4,7 @@
 #include <cstdint>
 #include <cstdio>
 #include <cuda_runtime.h>
+#include <cuda_pipeline_primitives.h>
 #include <fstream>
 #include <functional>
 #include <iostream>
@@ -189,6 +190,51 @@ __device__ void load_circles(
     }
 
     // Wait for everything to be loaded
+    __syncthreads();
+}
+
+__device__ void load_circles_async(
+    GmemCircles gmem_circles, SmemCircles smem_circles,
+    const uint32_t gmem_offset
+) {
+    // Move gmem arrays
+    float const *gmem_circle_x = gmem_circles.circle_x + gmem_offset;
+    float const *gmem_circle_y = gmem_circles.circle_y + gmem_offset;
+    float const *gmem_circle_radius = gmem_circles.circle_radius + gmem_offset;
+    float const *gmem_circle_red = gmem_circles.circle_red + gmem_offset;
+    float const *gmem_circle_green = gmem_circles.circle_green + gmem_offset;
+    float const *gmem_circle_blue = gmem_circles.circle_blue + gmem_offset;
+    float const *gmem_circle_alpha = gmem_circles.circle_alpha + gmem_offset;
+
+    // Iterate over circles
+    for (uint32_t vc = threadIdx.x; vc < smem_circles.n_circle / 4; vc += blockDim.x) {
+        // Get index to copy
+        const uint32_t c = vc * 4;
+        // Copy mem over
+        __pipeline_memcpy_async(&smem_circles.circle_x[c], &gmem_circle_x[c], sizeof(float4), 0);
+        __pipeline_memcpy_async(&smem_circles.circle_y[c], &gmem_circle_y[c], sizeof(float4), 0);
+        __pipeline_memcpy_async(&smem_circles.circle_radius[c], &gmem_circle_radius[c], sizeof(float4), 0);
+        __pipeline_memcpy_async(&smem_circles.circle_red[c], &gmem_circle_red[c], sizeof(float4), 0);
+        __pipeline_memcpy_async(&smem_circles.circle_green[c], &gmem_circle_green[c], sizeof(float4), 0);
+        __pipeline_memcpy_async(&smem_circles.circle_blue[c], &gmem_circle_blue[c], sizeof(float4), 0);
+        __pipeline_memcpy_async(&smem_circles.circle_alpha[c], &gmem_circle_alpha[c], sizeof(float4), 0);
+    }
+    __pipeline_commit();
+
+    // Handle tail
+    for (uint32_t c = (smem_circles.n_circle / 4) * 4 + threadIdx.x; c < smem_circles.n_circle; c += blockDim.x) {
+        // Scalar load 1 circle from GMEM to SMEM
+        smem_circles.circle_x[c] = gmem_circle_x[c];
+        smem_circles.circle_y[c] = gmem_circle_y[c];
+        smem_circles.circle_radius[c] = gmem_circle_radius[c];
+        smem_circles.circle_red[c] = gmem_circle_red[c];
+        smem_circles.circle_green[c] = gmem_circle_green[c];
+        smem_circles.circle_blue[c] = gmem_circle_blue[c];
+        smem_circles.circle_alpha[c] = gmem_circle_alpha[c];
+    }
+
+    // Wait for everything to be loaded
+    __pipeline_wait_prior(0);
     __syncthreads();
 }
 
