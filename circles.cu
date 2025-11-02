@@ -312,13 +312,11 @@ __device__ void sm_level_render_helper(
     const uint32_t tt_start_i, const uint32_t tt_start_j // thread tile coordinates
 ) {
     // Iterate over SMEM size chunks of circles
-    for (uint32_t idx = 0; idx < gmem_circles.n_circle / smem_circles.n_circle + 1; ++idx) { // +1 to handle tail
+    for (uint32_t idx = 0; idx < gmem_circles.n_circle / smem_circles.n_circle; ++idx) {
         // Load from GMEM to SMEM
-        const uint32_t num_circles_processed = smem_circles.n_circle * idx;
-        smem_circles.n_circle = min(smem_circles.n_circle, gmem_circles.n_circle - num_circles_processed);
         load_circles(
             gmem_circles, smem_circles,
-            num_circles_processed
+            smem_circles.n_circle * idx
         );
 
         // Process chunk of tile
@@ -329,6 +327,21 @@ __device__ void sm_level_render_helper(
 
         // Wait for the entire block to finish before loading the next
         __syncthreads();
+    }
+
+    // Handle tail
+    const uint32_t num_circles_processed = smem_circles.n_circle * (gmem_circles.n_circle / smem_circles.n_circle);
+    const uint32_t circles_left = gmem_circles.n_circle - num_circles_processed;
+    if (circles_left > 0) {
+        smem_circles.n_circle = circles_left;
+        load_circles(
+            gmem_circles, smem_circles,
+            num_circles_processed
+        );
+        thread_level_render<T_TH, T_TW>(smem_circles,
+            tt_start_i, tt_start_j,
+            tt_img_red, tt_img_green, tt_img_blue
+        );
     }
 
     // Write back to main memory at the end
