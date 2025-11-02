@@ -113,39 +113,6 @@ void render_cpu(
 
 namespace circles_gpu {
 
-// template <uint32_t T_TH, uint32_t T_TW>
-// __device__ void thread_level_render_helper(
-//     const float c_x, const float c_y, const float c_radius,
-//     const float c_red, const float c_green, const float c_blue, const float c_alpha,
-//     const uint32_t start_i, const uint32_t start_j, const uint32_t end_i, const uint32_t end_j,
-//     float *thread_img_red, float *thread_img_green, float *thread_img_blue
-// ) {
-//     // Iterate over **all pixels in the thread tile**, ignoring circle bounds
-//     for (int32_t i = 0; i < T_TH; ++i) {
-//         for (int32_t j = 0; j < T_TW; ++j) {
-//             const int32_t global_i = start_i + i;
-//             const int32_t global_j = start_j + j;
-
-//             // Compute dx, dy for circle
-//             const float dy = global_i - c_y;
-//             const float dx = global_j - c_x;
-
-//             // Only update pixel if inside circle
-//             if (!(int32_t(c_x - c_radius) <= global_j && global_j <= int32_t(c_x + c_radius + 1.0f) &&
-//                 int32_t(c_y - c_radius) <= global_i && global_i <= int32_t(c_y + c_radius + 1.0f) &&
-//                 dx * dx + dy * dy < c_radius * c_radius)) {
-//                 continue;
-//             }
-
-//             // Update pixel
-//             const uint32_t p = i * T_TW + j;
-//             thread_img_red[p]   = thread_img_red[p] * (1.0f - c_alpha) + c_red * c_alpha;
-//             thread_img_green[p] = thread_img_green[p] * (1.0f - c_alpha) + c_green * c_alpha;
-//             thread_img_blue[p]  = thread_img_blue[p] * (1.0f - c_alpha) + c_blue * c_alpha;
-//         }
-//     }
-// }
-
 template <uint32_t T_TH, uint32_t T_TW>
 __device__ void thread_level_render_helper(
     const float c_x, const float c_y, const float c_radius,
@@ -153,7 +120,6 @@ __device__ void thread_level_render_helper(
     const uint32_t start_i, const uint32_t start_j, const uint32_t end_i, const uint32_t end_j,
     float *thread_img_red, float *thread_img_green, float *thread_img_blue
 ) {
-    // Might be faster + simpler to just iterate over tile pixels?
     // Get intersection of circle and thread subtile pixels
     const int32_t start_inter_i = max(int32_t(c_y - c_radius), (int32_t)start_i);
     const int32_t end_inter_i = min(int32_t(c_y + c_radius + 1.0f), (int32_t)end_i - 1);
@@ -258,6 +224,37 @@ __device__ void thread_level_render(
     }
 }
 
+template <uint32_t T_TH, uint32_t T_TW>
+__device__ void sm_level_render_helper(
+    const uint32_t width, const uint32_t height,
+    const uint32_t n_circle,
+    float const *circle_x, float const *circle_y, float const *circle_radius,
+    float const *circle_red, float const *circle_green, float const *circle_blue, float const *circle_alpha,
+    float *img_red, float *img_green, float *img_blue,
+    float *tt_img_red, float *tt_img_green, float *tt_img_blue,
+    const uint32_t tt_start_i, const uint32_t tt_start_j // thread tile coordinates
+) {
+    // Process tile
+    thread_level_render<T_TH, T_TW>(n_circle,
+        circle_x, circle_y, circle_radius,
+        circle_red, circle_green, circle_blue, circle_alpha,
+        tt_start_i, tt_start_j,
+            tt_img_red, tt_img_green, tt_img_blue
+    );
+
+    // Write back to main memory at the end
+    #pragma unroll
+        for (uint32_t p = 0; p < T_TH * T_TW; ++p) {
+        // Convert 1D to 2D indices
+        const uint32_t i = tt_start_i + p / T_TW;
+        const uint32_t j = tt_start_j + p % T_TW;
+        // Write back
+        img_red[i * width + j] = tt_img_red[p];
+        img_green[i * width + j] = tt_img_green[p];
+        img_blue[i * width + j] = tt_img_blue[p];
+    }
+}
+
 template <uint32_t SM_TH, uint32_t SM_TW, uint32_t T_TH, uint32_t T_TW>
 __device__ void sm_level_render(
     const uint32_t width, const uint32_t height,
@@ -268,7 +265,7 @@ __device__ void sm_level_render(
     const uint32_t smt_start_i, const uint32_t smt_start_j // sm tile coordinates
 ) {
     // Thread grid dimensions
-    constexpr uint32_t tt_per_i = SM_TH / T_TH;
+    // constexpr uint32_t tt_per_i = SM_TH / T_TH;
     constexpr uint32_t tt_per_j = SM_TW / T_TW;
     const uint32_t tt_i = threadIdx.x / tt_per_j;
     const uint32_t tt_j = threadIdx.x % tt_per_j;
@@ -283,26 +280,17 @@ __device__ void sm_level_render(
         float tt_img_green[4] = {1.0f, 1.0f, 1.0f, 1.0f};
         float tt_img_blue[4] = {1.0f, 1.0f, 1.0f, 1.0f};
 
-        // Process tile
-        thread_level_render<T_TH, T_TW>(n_circle,
+        sm_level_render_helper<T_TH, T_TW>(
+            width, height,
+            n_circle,
             circle_x, circle_y, circle_radius,
             circle_red, circle_green, circle_blue, circle_alpha,
-            tt_start_i, tt_start_j,
-            tt_img_red, tt_img_green, tt_img_blue
+            img_red, img_green, img_blue,
+            tt_img_red, tt_img_green, tt_img_blue,
+            tt_start_i, tt_start_j
         );
-
-        // Write back to main memory at the end
-        #pragma unroll
-        for (uint32_t p = 0; p < T_TH * T_TW; ++p) {
-            // Convert 1D to 2D indices
-            const uint32_t i = tt_start_i + p / T_TW;
-            const uint32_t j = tt_start_j + p % T_TW;
-            // Write back
-            img_red[i * width + j] = tt_img_red[p];
-            img_green[i * width + j] = tt_img_green[p];
-            img_blue[i * width + j] = tt_img_blue[p];
-        }
     } else if constexpr (T_TH * T_TW == 64) {
+        // TODO: Find a better way to compile time initialize these arrays
         float tt_img_red[64] = {
             1.0f, 1.0f, 1.0f, 1.0f, 1.0f, 1.0f, 1.0f, 1.0f, 
             1.0f, 1.0f, 1.0f, 1.0f, 1.0f, 1.0f, 1.0f, 1.0f, 
@@ -333,20 +321,15 @@ __device__ void sm_level_render(
             1.0f, 1.0f, 1.0f, 1.0f, 1.0f, 1.0f, 1.0f, 1.0f, 
             1.0f, 1.0f, 1.0f, 1.0f, 1.0f, 1.0f, 1.0f, 1.0f
         };
-        thread_level_render<T_TH, T_TW>(n_circle,
+        sm_level_render_helper<T_TH, T_TW>(
+            width, height,
+            n_circle,
             circle_x, circle_y, circle_radius,
             circle_red, circle_green, circle_blue, circle_alpha,
-            tt_start_i, tt_start_j,
-            tt_img_red, tt_img_green, tt_img_blue
+            img_red, img_green, img_blue,
+            tt_img_red, tt_img_green, tt_img_blue,
+            tt_start_i, tt_start_j
         );
-        #pragma unroll
-        for (uint32_t p = 0; p < T_TH * T_TW; ++p) {
-            const uint32_t i = tt_start_i + p / T_TW;
-            const uint32_t j = tt_start_j + p % T_TW;
-            img_red[i * width + j] = tt_img_red[p];
-            img_green[i * width + j] = tt_img_green[p];
-            img_blue[i * width + j] = tt_img_blue[p];
-        }
     } else {
         return;
     }
@@ -356,9 +339,10 @@ template <
     uint32_t SM_TH, uint32_t SM_TW, // SM tile size
     uint32_t T_TH, uint32_t T_TW // Thread tile size
 >
+__launch_bounds__(8*32)
 __global__ void gpu_level_render(
-    uint32_t width, uint32_t height, // img size
-    uint32_t n_circle, // num circles
+    const uint32_t width, const uint32_t height, // img size
+    const uint32_t n_circle, // num circles
     float const *circle_x, float const *circle_y, float const *circle_radius, // circle size arrays
     float const *circle_red, float const *circle_green, float const *circle_blue, float const *circle_alpha, // circle color arrays
     float *img_red, float *img_green, float *img_blue // output img
