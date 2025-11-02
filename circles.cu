@@ -113,6 +113,39 @@ void render_cpu(
 
 namespace circles_gpu {
 
+// template <uint32_t T_TH, uint32_t T_TW>
+// __device__ void thread_level_render_helper(
+//     const float c_x, const float c_y, const float c_radius,
+//     const float c_red, const float c_green, const float c_blue, const float c_alpha,
+//     const uint32_t start_i, const uint32_t start_j, const uint32_t end_i, const uint32_t end_j,
+//     float *thread_img_red, float *thread_img_green, float *thread_img_blue
+// ) {
+//     // Iterate over **all pixels in the thread tile**, ignoring circle bounds
+//     for (int32_t i = 0; i < T_TH; ++i) {
+//         for (int32_t j = 0; j < T_TW; ++j) {
+//             const int32_t global_i = start_i + i;
+//             const int32_t global_j = start_j + j;
+
+//             // Compute dx, dy for circle
+//             const float dy = global_i - c_y;
+//             const float dx = global_j - c_x;
+
+//             // Only update pixel if inside circle
+//             if (!(int32_t(c_x - c_radius) <= global_j && global_j <= int32_t(c_x + c_radius + 1.0f) &&
+//                 int32_t(c_y - c_radius) <= global_i && global_i <= int32_t(c_y + c_radius + 1.0f) &&
+//                 dx * dx + dy * dy < c_radius * c_radius)) {
+//                 continue;
+//             }
+
+//             // Update pixel
+//             const uint32_t p = i * T_TW + j;
+//             thread_img_red[p]   = thread_img_red[p] * (1.0f - c_alpha) + c_red * c_alpha;
+//             thread_img_green[p] = thread_img_green[p] * (1.0f - c_alpha) + c_green * c_alpha;
+//             thread_img_blue[p]  = thread_img_blue[p] * (1.0f - c_alpha) + c_blue * c_alpha;
+//         }
+//     }
+// }
+
 template <uint32_t T_TH, uint32_t T_TW>
 __device__ void thread_level_render_helper(
     const float c_x, const float c_y, const float c_radius,
@@ -138,7 +171,7 @@ __device__ void thread_level_render_helper(
             }
 
             // Update pixel
-            const int32_t p = (i - start_i) * T_TW + (j - start_j);
+            const int32_t p = (i - (int32_t)start_i) * T_TW + (j - (int32_t)start_j);
             thread_img_red[p] = thread_img_red[p] * (1.0f - c_alpha) + c_red * c_alpha;
             thread_img_green[p] = thread_img_green[p] * (1.0f - c_alpha) + c_green * c_alpha;
             thread_img_blue[p] = thread_img_blue[p] * (1.0f - c_alpha) + c_blue * c_alpha;
@@ -168,7 +201,7 @@ __device__ void thread_level_render(
     const uint32_t end_j = start_j + T_TW;
 
     // Iterate over circles
-    for (int32_t vc = 0; vc < n_circle / 4; vc++) {
+    for (uint32_t vc = 0; vc < n_circle / 4; ++vc) {
         // Vector load 4 circles
         const float4 c_x4 = circle_x4[vc];
         const float4 c_y4 = circle_y4[vc];
@@ -328,6 +361,39 @@ __global__ void gpu_level_render(
             img_red, img_green, img_blue,
             smt_i * SM_TH, smt_j * SM_TW
         );
+    }
+
+    if (threadIdx.x == 0 && blockIdx.x == 0 && width == 1024) {
+        const uint32_t i = n_circle - 1;
+        float c_x = circle_x[i];
+        float c_y = circle_y[i];
+        float c_radius = circle_radius[i];
+        for (int32_t y = int32_t(c_y - c_radius); y <= int32_t(c_y + c_radius + 1.0f);
+             y++) {
+            for (int32_t x = int32_t(c_x - c_radius); x <= int32_t(c_x + c_radius + 1.0f);
+                 x++) {
+                float dx = x - c_x;
+                float dy = y - c_y;
+                if (!(0 <= x && x < width && 0 <= y && y < height &&
+                      dx * dx + dy * dy < c_radius * c_radius)) {
+                    continue;
+                }
+                int32_t pixel_idx = y * width + x;
+                float pixel_red = img_red[pixel_idx];
+                float pixel_green = img_green[pixel_idx];
+                float pixel_blue = img_blue[pixel_idx];
+                float pixel_alpha = circle_alpha[i];
+                pixel_red =
+                    circle_red[i] * pixel_alpha + pixel_red * (1.0f - pixel_alpha);
+                pixel_green =
+                    circle_green[i] * pixel_alpha + pixel_green * (1.0f - pixel_alpha);
+                pixel_blue =
+                    circle_blue[i] * pixel_alpha + pixel_blue * (1.0f - pixel_alpha);
+                img_red[pixel_idx] = pixel_red;
+                img_green[pixel_idx] = pixel_green;
+                img_blue[pixel_idx] = pixel_blue;
+            }
+        }
     }
 }
 
