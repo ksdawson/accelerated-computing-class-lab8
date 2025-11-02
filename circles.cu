@@ -518,6 +518,29 @@ __global__ void gpu_level_render(
     }
 }
 
+template <uint32_t SM_TH, uint32_t SM_TW, uint32_t T_TH, uint32_t T_TW, uint32_t NC>
+void launch_specialized_kernel(
+    const uint32_t width, const uint32_t height,
+    GmemCircles gmem_circles,
+    float *img_red, float *img_green, float *img_blue
+) {
+    // For each tile run a scan using the full grid to get the circles actually in the tile
+    // const uint32_t smt_per_i = height / SM_TH;
+    // const uint32_t smt_per_j = width / SM_TW;
+
+    // Launch render kernel
+    constexpr int smem_size_bytes = NC * 7 * sizeof(float); // 7 float arrays
+    cudaFuncSetAttribute(
+        gpu_level_render<SM_TH, SM_TW, T_TH, T_TW, NC>,
+        cudaFuncAttributeMaxDynamicSharedMemorySize,
+        smem_size_bytes
+    );
+    gpu_level_render<SM_TH, SM_TW, T_TH, T_TW, NC><<<48, 8*32, smem_size_bytes>>>(
+        width, height, gmem_circles,
+        img_red, img_green, img_blue
+    );
+}
+
 void launch_render(
     int32_t width,
     int32_t height,
@@ -536,26 +559,11 @@ void launch_render(
     // Test case sizes: 256x256, 1024x1024
     GmemCircles gmem_circles = {(uint32_t)n_circle, circle_x, circle_y, circle_radius, circle_red, circle_green, circle_blue, circle_alpha};
     if (height == 256 && width == 256) {
-        constexpr int smem_size_bytes = 80 * 7 * sizeof(float); // at most 80 circles w/ 7 arrays
-        cudaFuncSetAttribute(
-            gpu_level_render<32, 32, 2, 2, 80>,
-            cudaFuncAttributeMaxDynamicSharedMemorySize,
-            smem_size_bytes
-        );
-        gpu_level_render<32, 32, 2, 2, 80><<<48, 8*32, smem_size_bytes>>>(width, height, gmem_circles,
-            img_red, img_green, img_blue
-        );
+        constexpr uint32_t num_circles = 80; // at most 80 in the small test cases
+        launch_specialized_kernel<32, 32, 2, 2, num_circles>(width, height, gmem_circles, img_red, img_green, img_blue);
     } else if (height == 1024 && width == 1024) {
         constexpr uint32_t num_circles = 2000; // Tuning parameter
-        constexpr int smem_size_bytes = num_circles * 7 * sizeof(float); // 7 float arrays
-        cudaFuncSetAttribute(
-            gpu_level_render<128, 128, 8, 8, num_circles>,
-            cudaFuncAttributeMaxDynamicSharedMemorySize,
-            smem_size_bytes
-        );
-        gpu_level_render<128, 128, 8, 8, num_circles><<<48, 8*32, smem_size_bytes>>>(width, height, gmem_circles,
-            img_red, img_green, img_blue
-        );
+        launch_specialized_kernel<128, 128, 8, 8, num_circles>(width, height, gmem_circles, img_red, img_green, img_blue);
     } else {
         // Not handled
         return;
