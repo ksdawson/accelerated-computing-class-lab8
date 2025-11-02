@@ -111,7 +111,8 @@ void render_cpu(
 ////////////////////////////////////////////////////////////////////////////////
 // Optimized GPU Implementation
 
-struct Circles {
+// Generic helpers and data structures
+struct GmemCircles {
     const uint32_t n_circle;
     float const *circle_x;
     float const *circle_y;
@@ -121,6 +122,75 @@ struct Circles {
     float const *circle_blue;
     float const *circle_alpha;
 };
+struct SmemCircles { // The difference is SMEM is modifiable
+    uint32_t n_circle;
+    float *circle_x;
+    float *circle_y;
+    float *circle_radius;
+    float *circle_red;
+    float *circle_green;
+    float *circle_blue;
+    float *circle_alpha;
+};
+
+__device__ void load_circles(
+    GmemCircles gmem_circles, SmemCircles smem_circles,
+    const uint32_t gmem_offset
+) {
+    // Move gmem arrays
+    float const *gmem_circle_x = gmem_circles.circle_x + gmem_offset;
+    float const *gmem_circle_y = gmem_circles.circle_y + gmem_offset;
+    float const *gmem_circle_radius = gmem_circles.circle_radius + gmem_offset;
+    float const *gmem_circle_red = gmem_circles.circle_red + gmem_offset;
+    float const *gmem_circle_green = gmem_circles.circle_green + gmem_offset;
+    float const *gmem_circle_blue = gmem_circles.circle_blue + gmem_offset;
+    float const *gmem_circle_alpha = gmem_circles.circle_alpha + gmem_offset;
+
+    // Vectorize gmem circle arrays
+    float4 const *gmem_circle_x4 = reinterpret_cast<float4 const*>(gmem_circle_x);
+    float4 const *gmem_circle_y4 = reinterpret_cast<float4 const*>(gmem_circle_y);
+    float4 const *gmem_circle_radius4 = reinterpret_cast<float4 const*>(gmem_circle_radius);
+    float4 const *gmem_circle_red4 = reinterpret_cast<float4 const*>(gmem_circle_red);
+    float4 const *gmem_circle_green4 = reinterpret_cast<float4 const*>(gmem_circle_green);
+    float4 const *gmem_circle_blue4 = reinterpret_cast<float4 const*>(gmem_circle_blue);
+    float4 const *gmem_circle_alpha4 = reinterpret_cast<float4 const*>(gmem_circle_alpha);
+
+    // Vectorize smem circle arrays
+    float4 *smem_circle_x4 = reinterpret_cast<float4*>(smem_circles.circle_x);
+    float4 *smem_circle_y4 = reinterpret_cast<float4*>(smem_circles.circle_y);
+    float4 *smem_circle_radius4 = reinterpret_cast<float4*>(smem_circles.circle_radius);
+    float4 *smem_circle_red4 = reinterpret_cast<float4*>(smem_circles.circle_red);
+    float4 *smem_circle_green4 = reinterpret_cast<float4*>(smem_circles.circle_green);
+    float4 *smem_circle_blue4 = reinterpret_cast<float4*>(smem_circles.circle_blue);
+    float4 *smem_circle_alpha4 = reinterpret_cast<float4*>(smem_circles.circle_alpha);
+
+    // Iterate over circles
+    for (uint32_t vc = threadIdx.x; vc < smem_circles.n_circle / 4; vc += blockDim.x) {
+        // Vector load 4 circles from GMEM to SMEM
+        smem_circle_x4[vc] = gmem_circle_x4[vc];
+        smem_circle_y4[vc] = gmem_circle_y4[vc];
+        smem_circle_radius4[vc] = gmem_circle_radius4[vc];
+        smem_circle_red4[vc] = gmem_circle_red4[vc];
+        smem_circle_green4[vc] = gmem_circle_green4[vc];
+        smem_circle_blue4[vc] = gmem_circle_blue4[vc];
+        smem_circle_alpha4[vc] = gmem_circle_alpha4[vc];
+    }
+
+    // Handle tail
+    for (uint32_t c = (smem_circles.n_circle / 4) * 4 + threadIdx.x; c < smem_circles.n_circle; c += blockDim.x) {
+        // Scalar load 1 circle from GMEM to SMEM
+        smem_circles.circle_x[c] = gmem_circle_x[c];
+        smem_circles.circle_y[c] = gmem_circle_y[c];
+        smem_circles.circle_radius[c] = gmem_circle_radius[c];
+        smem_circles.circle_red[c] = gmem_circle_red[c];
+        smem_circles.circle_green[c] = gmem_circle_green[c];
+        smem_circles.circle_blue[c] = gmem_circle_blue[c];
+        smem_circles.circle_alpha[c] = gmem_circle_alpha[c];
+    }
+
+    // Wait for everything to be loaded
+    __syncthreads();
+}
 
 namespace circles_gpu {
 
@@ -158,25 +228,25 @@ __device__ void thread_level_render_helper(
 
 template <uint32_t T_TH, uint32_t T_TW>
 __device__ void thread_level_render(
-    Circles global_circles,
+    SmemCircles circles,
     const uint32_t start_i, const uint32_t start_j, // thread tile coordinates
     float *thread_img_red, float *thread_img_green, float *thread_img_blue // thread output img
 ) {
     // Vectorize circle arrays
-    float4 const *circle_x4 = reinterpret_cast<float4 const*>(global_circles.circle_x);
-    float4 const *circle_y4 = reinterpret_cast<float4 const*>(global_circles.circle_y);
-    float4 const *circle_radius4 = reinterpret_cast<float4 const*>(global_circles.circle_radius);
-    float4 const *circle_red4 = reinterpret_cast<float4 const*>(global_circles.circle_red);
-    float4 const *circle_green4 = reinterpret_cast<float4 const*>(global_circles.circle_green);
-    float4 const *circle_blue4 = reinterpret_cast<float4 const*>(global_circles.circle_blue);
-    float4 const *circle_alpha4 = reinterpret_cast<float4 const*>(global_circles.circle_alpha);
+    float4 *circle_x4 = reinterpret_cast<float4*>(circles.circle_x);
+    float4 *circle_y4 = reinterpret_cast<float4*>(circles.circle_y);
+    float4 *circle_radius4 = reinterpret_cast<float4*>(circles.circle_radius);
+    float4 *circle_red4 = reinterpret_cast<float4*>(circles.circle_red);
+    float4 *circle_green4 = reinterpret_cast<float4*>(circles.circle_green);
+    float4 *circle_blue4 = reinterpret_cast<float4*>(circles.circle_blue);
+    float4 *circle_alpha4 = reinterpret_cast<float4*>(circles.circle_alpha);
 
     // Tile dimensions
     const uint32_t end_i = start_i + T_TH;
     const uint32_t end_j = start_j + T_TW;
 
     // Iterate over circles
-    for (uint32_t vc = 0; vc < global_circles.n_circle / 4; ++vc) {
+    for (uint32_t vc = 0; vc < circles.n_circle / 4; ++vc) {
         // Vector load 4 circles
         const float4 c_x4 = circle_x4[vc];
         const float4 c_y4 = circle_y4[vc];
@@ -214,15 +284,15 @@ __device__ void thread_level_render(
     }
 
     // Handle tail
-    for (uint32_t c = (global_circles.n_circle / 4) * 4; c < global_circles.n_circle; ++c) {
+    for (uint32_t c = (circles.n_circle / 4) * 4; c < circles.n_circle; ++c) {
         // Scalar load circle
-        const float c_x = global_circles.circle_x[c];
-        const float c_y = global_circles.circle_y[c];
-        const float c_radius = global_circles.circle_radius[c];
-        const float c_red = global_circles.circle_red[c];
-        const float c_green = global_circles.circle_green[c];
-        const float c_blue = global_circles.circle_blue[c];
-        const float c_alpha = global_circles.circle_alpha[c];
+        const float c_x = circles.circle_x[c];
+        const float c_y = circles.circle_y[c];
+        const float c_radius = circles.circle_radius[c];
+        const float c_red = circles.circle_red[c];
+        const float c_green = circles.circle_green[c];
+        const float c_blue = circles.circle_blue[c];
+        const float c_alpha = circles.circle_alpha[c];
         // Process circle
         thread_level_render_helper<T_TH, T_TW>(
             c_x, c_y, c_radius,
@@ -236,16 +306,30 @@ __device__ void thread_level_render(
 template <uint32_t T_TH, uint32_t T_TW>
 __device__ void sm_level_render_helper(
     const uint32_t width, const uint32_t height,
-    Circles global_circles,
+    GmemCircles gmem_circles, SmemCircles smem_circles,
     float *img_red, float *img_green, float *img_blue,
     float *tt_img_red, float *tt_img_green, float *tt_img_blue,
     const uint32_t tt_start_i, const uint32_t tt_start_j // thread tile coordinates
 ) {
-    // Process tile
-    thread_level_render<T_TH, T_TW>(global_circles,
-        tt_start_i, tt_start_j,
-        tt_img_red, tt_img_green, tt_img_blue
-    );
+    // Iterate over SMEM size chunks of circles
+    for (uint32_t idx = 0; idx < gmem_circles.n_circle / smem_circles.n_circle + 1; ++idx) { // +1 to handle tail
+        // Load from GMEM to SMEM
+        const uint32_t num_circles_processed = smem_circles.n_circle * idx;
+        smem_circles.n_circle = min(smem_circles.n_circle, gmem_circles.n_circle - num_circles_processed);
+        load_circles(
+            gmem_circles, smem_circles,
+            num_circles_processed
+        );
+
+        // Process chunk of tile
+        thread_level_render<T_TH, T_TW>(smem_circles,
+            tt_start_i, tt_start_j,
+            tt_img_red, tt_img_green, tt_img_blue
+        );
+
+        // Wait for the entire block to finish before loading the next
+        __syncthreads();
+    }
 
     // Write back to main memory at the end
     #pragma unroll
@@ -263,7 +347,7 @@ __device__ void sm_level_render_helper(
 template <uint32_t SM_TH, uint32_t SM_TW, uint32_t T_TH, uint32_t T_TW>
 __device__ void sm_level_render(
     const uint32_t width, const uint32_t height,
-    Circles global_circles,
+    GmemCircles gmem_circles, SmemCircles smem_circles,
     float *img_red, float *img_green, float *img_blue,
     const uint32_t smt_start_i, const uint32_t smt_start_j // sm tile coordinates
 ) {
@@ -285,7 +369,7 @@ __device__ void sm_level_render(
 
         sm_level_render_helper<T_TH, T_TW>(
             width, height,
-            global_circles,
+            gmem_circles, smem_circles,
             img_red, img_green, img_blue,
             tt_img_red, tt_img_green, tt_img_blue,
             tt_start_i, tt_start_j
@@ -324,7 +408,7 @@ __device__ void sm_level_render(
         };
         sm_level_render_helper<T_TH, T_TW>(
             width, height,
-            global_circles,
+            gmem_circles, smem_circles,
             img_red, img_green, img_blue,
             tt_img_red, tt_img_green, tt_img_blue,
             tt_start_i, tt_start_j
@@ -336,12 +420,13 @@ __device__ void sm_level_render(
 
 template <
     uint32_t SM_TH, uint32_t SM_TW, // SM tile size
-    uint32_t T_TH, uint32_t T_TW // Thread tile size
+    uint32_t T_TH, uint32_t T_TW, // Thread tile size
+    uint32_t SMEM_TD // SMEM size
 >
 __launch_bounds__(8*32)
 __global__ void gpu_level_render(
     const uint32_t width, const uint32_t height, // img size
-    Circles global_circles,
+    GmemCircles gmem_circles,
     float *img_red, float *img_green, float *img_blue // output img
 ) {
     // SM grid dimensions
@@ -350,7 +435,15 @@ __global__ void gpu_level_render(
 
     // Setup the block's SMEM
     extern __shared__ float smem[];
-    // TODO: Split the SMEM into 7 arrays
+    // Split the SMEM into 7 arrays
+    float *circle_x = smem;
+    float *circle_y = circle_x + SMEM_TD;
+    float *circle_radius = circle_y + SMEM_TD;
+    float *circle_red = circle_radius + SMEM_TD;
+    float *circle_green = circle_red + SMEM_TD;
+    float *circle_blue = circle_green + SMEM_TD;
+    float *circle_alpha = circle_blue + SMEM_TD;
+    SmemCircles smem_circles = {SMEM_TD, circle_x, circle_y, circle_radius, circle_red, circle_green, circle_blue, circle_alpha};
 
     // Iterate over SM tiles
     for (uint32_t sm_idx = blockIdx.x; sm_idx < smt_per_i * smt_per_j; sm_idx += gridDim.x) {
@@ -359,7 +452,7 @@ __global__ void gpu_level_render(
         const uint32_t smt_j = sm_idx % smt_per_j;
 
         // Process tile
-        sm_level_render<SM_TH, SM_TW, T_TH, T_TW>(width, height, global_circles,
+        sm_level_render<SM_TH, SM_TW, T_TH, T_TW>(width, height, gmem_circles, smem_circles,
             img_red, img_green, img_blue,
             smt_i * SM_TH, smt_j * SM_TW
         );
@@ -382,26 +475,26 @@ void launch_render(
     float *img_blue,            // pointer to GPU memory
     GpuMemoryPool &memory_pool) {
     // Test case sizes: 256x256, 1024x1024
-    Circles global_circles = {(uint32_t)n_circle, circle_x, circle_y, circle_radius, circle_red, circle_green, circle_blue, circle_alpha};
+    GmemCircles gmem_circles = {(uint32_t)n_circle, circle_x, circle_y, circle_radius, circle_red, circle_green, circle_blue, circle_alpha};
     if (height == 256 && width == 256) {
         constexpr int smem_size_bytes = 80 * 7 * sizeof(float); // at most 80 circles w/ 7 arrays
         cudaFuncSetAttribute(
-            gpu_level_render<32, 32, 2, 2>,
+            gpu_level_render<32, 32, 2, 2, 80>,
             cudaFuncAttributeMaxDynamicSharedMemorySize,
             smem_size_bytes
         );
-        gpu_level_render<32, 32, 2, 2><<<48, 8*32, smem_size_bytes>>>(width, height, global_circles,
+        gpu_level_render<32, 32, 2, 2, 80><<<48, 8*32, smem_size_bytes>>>(width, height, gmem_circles,
             img_red, img_green, img_blue
         );
     } else if (height == 1024 && width == 1024) {
         constexpr uint32_t num_circles = 1000; // Tuning parameter
         constexpr int smem_size_bytes = num_circles * 7 * sizeof(float); // 7 float arrays
         cudaFuncSetAttribute(
-            gpu_level_render<128, 128, 8, 8>,
+            gpu_level_render<128, 128, 8, 8, num_circles>,
             cudaFuncAttributeMaxDynamicSharedMemorySize,
             smem_size_bytes
         );
-        gpu_level_render<128, 128, 8, 8><<<48, 8*32, smem_size_bytes>>>(width, height, global_circles,
+        gpu_level_render<128, 128, 8, 8, num_circles><<<48, 8*32, smem_size_bytes>>>(width, height, gmem_circles,
             img_red, img_green, img_blue
         );
     } else {
