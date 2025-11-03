@@ -528,11 +528,62 @@ __device__ bool circle_intersects_rect(
 
 // Scan code
 template <typename Op>
-__global__ void create_flag_array(GmemCircles gmem_circles,
+__device__ void scalar_create_flag_array(GmemCircles gmem_circles,
     const uint32_t start_i, const uint32_t start_j, const uint32_t end_i, const uint32_t end_j,
     typename Op::Data *flag_arr
 ) {
     for (uint32_t c = blockIdx.x * blockDim.x + threadIdx.x; c < gmem_circles.n_circle; c += gridDim.x * blockDim.x) {
+        // Scalar load circle
+        const float c_x = gmem_circles.circle_x[c];
+        const float c_y = gmem_circles.circle_y[c];
+        const float c_radius = gmem_circles.circle_radius[c];
+
+        // Set flag
+        flag_arr[c] = circle_intersects_rect(c_x, c_y, c_radius,
+            (float)start_j, (float)start_i,
+            float(end_j - 1), float(end_i - 1)
+        );
+    }
+}
+template <typename Op>
+__global__ void create_flag_array(GmemCircles gmem_circles,
+    const uint32_t start_i, const uint32_t start_j, const uint32_t end_i, const uint32_t end_j,
+    typename Op::Data *flag_arr
+) {
+    // If size is less than vector size use scalar version
+    if (gmem_circles.n_circle < 16) {
+        scalar_create_flag_array<Op>(gmem_circles, start_i, start_j, end_i, end_j, flag_arr);
+        return;
+    }
+
+    // Vectorize gmem circle arrays
+    float4 const *gmem_circle_x4 = reinterpret_cast<float4 const*>(gmem_circles.circle_x);
+    float4 const *gmem_circle_y4 = reinterpret_cast<float4 const*>(gmem_circles.circle_y);
+    float4 const *gmem_circle_radius4 = reinterpret_cast<float4 const*>(gmem_circles.circle_radius);
+
+    // Vectorize flag array
+    using Data = typename Op::Data;
+    using VecData = Vectorized<Data, 4>;
+    VecData *flag_arr4 = reinterpret_cast<VecData*>(flag_arr);
+
+    // Handle vectors
+    for (uint32_t vc = blockIdx.x * blockDim.x + threadIdx.x; vc < gmem_circles.n_circle / 4; vc += gridDim.x * blockDim.x) {
+        // Vector load circles
+        const float4 c_x4 = gmem_circle_x4[vc];
+        const float4 c_y4 = gmem_circle_y4[vc];
+        const float4 c_radius4 = gmem_circle_radius4[vc];
+
+        // Set flags
+        VecData result;
+        result.elements[0] = circle_intersects_rect(c_x4.x, c_y4.x, c_radius4.x, (float)start_j, (float)start_i, float(end_j - 1), float(end_i - 1));
+        result.elements[1] = circle_intersects_rect(c_x4.y, c_y4.y, c_radius4.y, (float)start_j, (float)start_i, float(end_j - 1), float(end_i - 1));
+        result.elements[2] = circle_intersects_rect(c_x4.z, c_y4.z, c_radius4.z, (float)start_j, (float)start_i, float(end_j - 1), float(end_i - 1));
+        result.elements[3] = circle_intersects_rect(c_x4.w, c_y4.w, c_radius4.w, (float)start_j, (float)start_i, float(end_j - 1), float(end_i - 1));
+        flag_arr4[vc] = result;
+    }
+
+    // Handle tail
+    for (uint32_t c = (gmem_circles.n_circle / 4) * 4 + (blockIdx.x * blockDim.x + threadIdx.x); c < gmem_circles.n_circle; c += gridDim.x * blockDim.x) {
         // Scalar load circle
         const float c_x = gmem_circles.circle_x[c];
         const float c_y = gmem_circles.circle_y[c];
