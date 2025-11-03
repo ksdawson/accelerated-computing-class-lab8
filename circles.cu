@@ -837,6 +837,10 @@ __global__ void gpu_level_render(
         const uint32_t smt_i = sm_idx / smt_per_j;
         const uint32_t smt_j = sm_idx % smt_per_j;
 
+        // if (threadIdx.x == 0 && sm_idx <= 15) {
+        //     printf("tile, n: %d, %d\n", sm_idx, sm_gmem_circles_arr[sm_idx].n_circle);
+        // }
+
         // Process tile
         sm_level_render<SM_TH, SM_TW, T_TH, T_TW>(width, height, sm_gmem_circles_arr[sm_idx], smem_circles,
             img_red, img_green, img_blue,
@@ -864,7 +868,7 @@ void launch_specialized_kernel(
     const uint32_t num_circles = gmem_circles.n_circle; // The max number of circles per tile -> tune
     const uint32_t num_circles_aligned = (num_circles + 3) & ~3u;
     const size_t extract_data_size = num_tiles * (7 * sizeof(float)) * num_circles_aligned; // tiles x circles x 7 float arrays
-    const size_t sm_gmem_circles_size = num_tiles * sizeof(SmemCircles);
+    const size_t sm_gmem_circles_size = num_tiles * sizeof(GmemCircles);
 
     // Setup extra gmem
     void *seed = reinterpret_cast<void*>(memory_pool.alloc(scan_size));
@@ -877,7 +881,7 @@ void launch_specialized_kernel(
         // Setup sm_gmem_circles
         const uint32_t tile_offset = sm_idx * (7 * num_circles_aligned);
         float *sm_gmem_circles_workspace = sm_gmem_circles_workspaces + tile_offset;
-        SmemCircles sm_gmem_circles = {0,
+        SmemCircles sm_gmem_circles = {0, // Set n_circle after scan
             sm_gmem_circles_workspace + 0 * num_circles_aligned,
             sm_gmem_circles_workspace + 1 * num_circles_aligned,
             sm_gmem_circles_workspace + 2 * num_circles_aligned,
@@ -885,7 +889,7 @@ void launch_specialized_kernel(
             sm_gmem_circles_workspace + 4 * num_circles_aligned,
             sm_gmem_circles_workspace + 5 * num_circles_aligned,
             sm_gmem_circles_workspace + 6 * num_circles_aligned,
-        }; // Set n_circle after scan
+        };
 
         // SM tile indices
         const uint32_t smt_i = sm_idx / smt_per_j;
@@ -916,19 +920,25 @@ void launch_specialized_kernel(
         // printf("wxh, tile, n_circle: %dx%d, %d, %d\n", width, height, sm_idx, last_run);
 
         // Convert to GmemCircles
-        GmemCircles const_sm_gmem_circles = {
-            sm_gmem_circles.n_circle,
-            sm_gmem_circles.circle_x,
-            sm_gmem_circles.circle_y,
-            sm_gmem_circles.circle_radius,
-            sm_gmem_circles.circle_red,
-            sm_gmem_circles.circle_green,
-            sm_gmem_circles.circle_blue,
-            sm_gmem_circles.circle_alpha
-        };
+        if (sm_idx > 15) {
+            GmemCircles const_sm_gmem_circles = {
+                sm_gmem_circles.n_circle,
+                sm_gmem_circles.circle_x,
+                sm_gmem_circles.circle_y,
+                sm_gmem_circles.circle_radius,
+                sm_gmem_circles.circle_red,
+                sm_gmem_circles.circle_green,
+                sm_gmem_circles.circle_blue,
+                sm_gmem_circles.circle_alpha
+            };
+            CUDA_CHECK(cudaMemcpy(&sm_gmem_circles_arr[sm_idx], &const_sm_gmem_circles, sizeof(GmemCircles), cudaMemcpyHostToDevice));
+        } else {
+            GmemCircles const_sm_gmem_circles = gmem_circles;
+            CUDA_CHECK(cudaMemcpy(&sm_gmem_circles_arr[sm_idx], &const_sm_gmem_circles, sizeof(GmemCircles), cudaMemcpyHostToDevice));
+        }
 
         // Store sm_gmem_circles in gpu memory
-        CUDA_CHECK(cudaMemcpy(&sm_gmem_circles_arr[sm_idx], &const_sm_gmem_circles, sizeof(GmemCircles), cudaMemcpyHostToDevice));
+        // CUDA_CHECK(cudaMemcpy(&sm_gmem_circles_arr[sm_idx], &const_sm_gmem_circles, sizeof(GmemCircles), cudaMemcpyHostToDevice));
     }
 
     // Launch render kernel
