@@ -813,7 +813,7 @@ __device__ void sm_level_render_helper(
     // Iterate over SMEM size chunks of circles
     for (uint32_t idx = 0; idx < gmem_circles.n_circle / smem_circles.n_circle; ++idx) {
         // Load from GMEM to SMEM
-        load_circles(
+        load_circles_async(
             gmem_circles, smem_circles,
             smem_circles.n_circle * idx
         );
