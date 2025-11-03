@@ -1067,7 +1067,7 @@ void launch_specialized_kernel(
         cudaFuncAttributeMaxDynamicSharedMemorySize,
         smem_size_bytes
     );
-    gpu_level_render<SM_TH, SM_TW, T_TH, T_TW, NC><<<48, 8*32, smem_size_bytes>>>(
+    gpu_level_render<SM_TH, SM_TW, T_TH, T_TW, NC><<<64, 8*32, smem_size_bytes>>>(
         width, height, sm_gmem_circles_arr,
         img_red, img_green, img_blue
     );
