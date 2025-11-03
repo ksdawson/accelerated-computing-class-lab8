@@ -505,10 +505,6 @@ __device__ void load_circles_async(
         smem_circles.circle_blue[c] = gmem_circle_blue[c];
         smem_circles.circle_alpha[c] = gmem_circle_alpha[c];
     }
-
-    // Wait for everything to be loaded
-    __pipeline_wait_prior(0);
-    __syncthreads();
 }
 
 namespace circles_gpu {
@@ -807,39 +803,57 @@ __device__ void thread_level_render(
 template <uint32_t T_TH, uint32_t T_TW>
 __device__ void sm_level_render_helper(
     const uint32_t width, const uint32_t height,
-    GmemCircles gmem_circles, SmemCircles smem_circles,
+    GmemCircles gmem_circles, SmemCircles smem_circles_compute, SmemCircles smem_circles_stage,
     float *img_red, float *img_green, float *img_blue,
     float *tt_img_red, float *tt_img_green, float *tt_img_blue,
     const uint32_t tt_start_i, const uint32_t tt_start_j // thread tile coordinates
 ) {
-    // Iterate over SMEM size chunks of circles
-    for (uint32_t idx = 0; idx < gmem_circles.n_circle / smem_circles.n_circle; ++idx) {
-        // Load from GMEM to SMEM
-        load_circles_async(
-            gmem_circles, smem_circles,
-            smem_circles.n_circle * idx
-        );
+    // Create pointers to double buffers for swapping
+    SmemCircles *compute_ptr = &smem_circles_compute;
+    SmemCircles *stage_ptr = &smem_circles_stage;
 
-        // Process chunk of tile
-        thread_level_render<T_TH, T_TW>(smem_circles,
+    const uint32_t num_blocks = gmem_circles.n_circle / smem_circles_compute.n_circle;
+    if (num_blocks > 0) {
+        // Load first buffer sync
+        load_circles(gmem_circles, smem_circles_compute, 0);
+
+        // Iterate over SMEM size chunks of circles
+        for (uint32_t idx = 0; idx < num_blocks - 1; ++idx) {
+            // Load stage buffer async
+            load_circles_async(
+                gmem_circles, *stage_ptr,
+                smem_circles_compute.n_circle * (idx + 1)
+            );
+
+            // Process chunk of tile
+            thread_level_render<T_TH, T_TW>(*compute_ptr,
+                tt_start_i, tt_start_j,
+                tt_img_red, tt_img_green, tt_img_blue
+            );
+
+            // Swap double buffers
+            __pipeline_wait_prior(0);
+            __syncthreads();
+            std::swap(compute_ptr, stage_ptr);
+        }
+        // Handle last block
+        thread_level_render<T_TH, T_TW>(*compute_ptr,
             tt_start_i, tt_start_j,
             tt_img_red, tt_img_green, tt_img_blue
         );
-
-        // Wait for the entire block to finish before loading the next
         __syncthreads();
     }
 
     // Handle tail
-    const uint32_t num_circles_processed = smem_circles.n_circle * (gmem_circles.n_circle / smem_circles.n_circle);
+    const uint32_t num_circles_processed = smem_circles_compute.n_circle * num_blocks;
     const uint32_t circles_left = gmem_circles.n_circle - num_circles_processed;
     if (circles_left > 0) {
-        smem_circles.n_circle = circles_left;
+        smem_circles_compute.n_circle = circles_left;
         load_circles(
-            gmem_circles, smem_circles,
+            gmem_circles, smem_circles_compute,
             num_circles_processed
         );
-        thread_level_render<T_TH, T_TW>(smem_circles,
+        thread_level_render<T_TH, T_TW>(smem_circles_compute,
             tt_start_i, tt_start_j,
             tt_img_red, tt_img_green, tt_img_blue
         );
@@ -864,7 +878,7 @@ __device__ void sm_level_render_helper(
 template <uint32_t SM_TH, uint32_t SM_TW, uint32_t T_TH, uint32_t T_TW>
 __device__ void sm_level_render(
     const uint32_t width, const uint32_t height,
-    GmemCircles gmem_circles, SmemCircles smem_circles,
+    GmemCircles gmem_circles, SmemCircles smem_circles_compute, SmemCircles smem_circles_stage,
     float *img_red, float *img_green, float *img_blue,
     const uint32_t smt_start_i, const uint32_t smt_start_j // sm tile coordinates
 ) {
@@ -886,7 +900,7 @@ __device__ void sm_level_render(
 
         sm_level_render_helper<T_TH, T_TW>(
             width, height,
-            gmem_circles, smem_circles,
+            gmem_circles, smem_circles_compute, smem_circles_stage,
             img_red, img_green, img_blue,
             tt_img_red, tt_img_green, tt_img_blue,
             tt_start_i, tt_start_j
@@ -925,7 +939,7 @@ __device__ void sm_level_render(
         };
         sm_level_render_helper<T_TH, T_TW>(
             width, height,
-            gmem_circles, smem_circles,
+            gmem_circles, smem_circles_compute, smem_circles_stage,
             img_red, img_green, img_blue,
             tt_img_red, tt_img_green, tt_img_blue,
             tt_start_i, tt_start_j
@@ -952,15 +966,25 @@ __global__ void gpu_level_render(
 
     // Setup the block's SMEM
     extern __shared__ float smem[];
-    // Split the SMEM into 7 arrays
-    float *circle_x = smem;
-    float *circle_y = circle_x + SMEM_TD;
-    float *circle_radius = circle_y + SMEM_TD;
-    float *circle_red = circle_radius + SMEM_TD;
-    float *circle_green = circle_red + SMEM_TD;
-    float *circle_blue = circle_green + SMEM_TD;
-    float *circle_alpha = circle_blue + SMEM_TD;
-    SmemCircles smem_circles = {SMEM_TD, circle_x, circle_y, circle_radius, circle_red, circle_green, circle_blue, circle_alpha};
+    // Split the SMEM into 7 arrays w/ double buffering
+    constexpr uint32_t double_buffer_size = SMEM_TD / 2;
+    float *circle_x_compute = smem;
+    float *circle_y_compute = circle_x_compute + double_buffer_size;
+    float *circle_radius_compute = circle_y_compute + double_buffer_size;
+    float *circle_red_compute = circle_radius_compute + double_buffer_size;
+    float *circle_green_compute = circle_red_compute + double_buffer_size;
+    float *circle_blue_compute = circle_green_compute + double_buffer_size;
+    float *circle_alpha_compute = circle_blue_compute + double_buffer_size;
+    SmemCircles smem_circles_compute = {double_buffer_size, circle_x_compute, circle_y_compute, circle_radius_compute, circle_red_compute, circle_green_compute, circle_blue_compute, circle_alpha_compute};
+    
+    float *circle_x_stage = circle_alpha_compute + double_buffer_size;
+    float *circle_y_stage = circle_x_stage + double_buffer_size;
+    float *circle_radius_stage = circle_y_stage + double_buffer_size;
+    float *circle_red_stage = circle_radius_stage + double_buffer_size;
+    float *circle_green_stage = circle_red_stage + double_buffer_size;
+    float *circle_blue_stage = circle_green_stage + double_buffer_size;
+    float *circle_alpha_stage = circle_blue_stage + double_buffer_size;
+    SmemCircles smem_circles_stage = {double_buffer_size, circle_x_stage, circle_y_stage, circle_radius_stage, circle_red_stage, circle_green_stage, circle_blue_stage, circle_alpha_stage};
 
     // Iterate over SM tiles
     for (uint32_t sm_idx = blockIdx.x; sm_idx < smt_per_i * smt_per_j; sm_idx += gridDim.x) {
@@ -969,7 +993,7 @@ __global__ void gpu_level_render(
         const uint32_t smt_j = sm_idx % smt_per_j;
 
         // Process tile
-        sm_level_render<SM_TH, SM_TW, T_TH, T_TW>(width, height, sm_gmem_circles_arr[sm_idx], smem_circles,
+        sm_level_render<SM_TH, SM_TW, T_TH, T_TW>(width, height, sm_gmem_circles_arr[sm_idx], smem_circles_compute, smem_circles_stage,
             img_red, img_green, img_blue,
             smt_i * SM_TH, smt_j * SM_TW
         );
