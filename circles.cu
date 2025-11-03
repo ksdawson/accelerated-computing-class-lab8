@@ -532,6 +532,12 @@ __device__ void scalar_create_flag_array(GmemCircles gmem_circles,
     const uint32_t start_i, const uint32_t start_j, const uint32_t end_i, const uint32_t end_j,
     typename Op::Data *flag_arr
 ) {
+    // Hoist tile bounds
+    const float start_jf = (float)start_j;
+    const float start_if = (float)start_i;
+    const float end_jf = float(end_j - 1);
+    const float end_if = float(end_i - 1);
+
     for (uint32_t c = blockIdx.x * blockDim.x + threadIdx.x; c < gmem_circles.n_circle; c += gridDim.x * blockDim.x) {
         // Scalar load circle
         const float c_x = gmem_circles.circle_x[c];
@@ -540,8 +546,7 @@ __device__ void scalar_create_flag_array(GmemCircles gmem_circles,
 
         // Set flag
         flag_arr[c] = circle_intersects_rect(c_x, c_y, c_radius,
-            (float)start_j, (float)start_i,
-            float(end_j - 1), float(end_i - 1)
+            start_jf, start_if, end_jf, end_if
         );
     }
 }
@@ -566,6 +571,12 @@ __global__ void create_flag_array(GmemCircles gmem_circles,
     using VecData = Vectorized<Data, 4>;
     VecData *flag_arr4 = reinterpret_cast<VecData*>(flag_arr);
 
+    // Hoist tile bounds
+    const float start_jf = (float)start_j;
+    const float start_if = (float)start_i;
+    const float end_jf = float(end_j - 1);
+    const float end_if = float(end_i - 1);
+
     // Handle vectors
     for (uint32_t vc = blockIdx.x * blockDim.x + threadIdx.x; vc < gmem_circles.n_circle / 4; vc += gridDim.x * blockDim.x) {
         // Vector load circles
@@ -575,10 +586,10 @@ __global__ void create_flag_array(GmemCircles gmem_circles,
 
         // Set flags
         VecData result;
-        result.elements[0] = circle_intersects_rect(c_x4.x, c_y4.x, c_radius4.x, (float)start_j, (float)start_i, float(end_j - 1), float(end_i - 1));
-        result.elements[1] = circle_intersects_rect(c_x4.y, c_y4.y, c_radius4.y, (float)start_j, (float)start_i, float(end_j - 1), float(end_i - 1));
-        result.elements[2] = circle_intersects_rect(c_x4.z, c_y4.z, c_radius4.z, (float)start_j, (float)start_i, float(end_j - 1), float(end_i - 1));
-        result.elements[3] = circle_intersects_rect(c_x4.w, c_y4.w, c_radius4.w, (float)start_j, (float)start_i, float(end_j - 1), float(end_i - 1));
+        result.elements[0] = circle_intersects_rect(c_x4.x, c_y4.x, c_radius4.x, start_jf, start_if, end_jf, end_if);
+        result.elements[1] = circle_intersects_rect(c_x4.y, c_y4.y, c_radius4.y, start_jf, start_if, end_jf, end_if);
+        result.elements[2] = circle_intersects_rect(c_x4.z, c_y4.z, c_radius4.z, start_jf, start_if, end_jf, end_if);
+        result.elements[3] = circle_intersects_rect(c_x4.w, c_y4.w, c_radius4.w, start_jf, start_if, end_jf, end_if);
         flag_arr4[vc] = result;
     }
 
@@ -591,8 +602,7 @@ __global__ void create_flag_array(GmemCircles gmem_circles,
 
         // Set flag
         flag_arr[c] = circle_intersects_rect(c_x, c_y, c_radius,
-            (float)start_j, (float)start_i,
-            float(end_j - 1), float(end_i - 1)
+            start_jf, start_if, end_jf, end_if
         );
     }
 }
