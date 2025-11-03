@@ -511,6 +511,21 @@ __device__ void load_circles_async(
 
 namespace circles_gpu {
 
+__device__ bool circle_intersects_rect(
+    const float cx, const float cy, const float radius,
+    const float rect_xmin, const float rect_ymin,
+    const float rect_xmax, const float rect_ymax
+) {
+    // Clamp circle center to rectangle
+    const float closest_x = fmaxf(rect_xmin, fminf(cx, rect_xmax));
+    const float closest_y = fmaxf(rect_ymin, fminf(cy, rect_ymax));
+
+    // Distance from circle center to closest point on rectangle
+    const float dx = closest_x - cx;
+    const float dy = closest_y - cy;
+    return (dx * dx + dy * dy) < (radius * radius);
+}
+
 // Scan code
 template <typename Op>
 __global__ void create_flag_array(GmemCircles gmem_circles,
@@ -523,16 +538,11 @@ __global__ void create_flag_array(GmemCircles gmem_circles,
         const float c_y = gmem_circles.circle_y[c];
         const float c_radius = gmem_circles.circle_radius[c];
 
-        // Get intersection of circle and tile pixels
-        const int32_t start_inter_i = max(int32_t(c_y - c_radius), (int32_t)start_i);
-        const int32_t end_inter_i = min(int32_t(c_y + c_radius + 1.0f), (int32_t)end_i - 1);
-        const int32_t start_inter_j = max(int32_t(c_x - c_radius), (int32_t)start_j);
-        const int32_t end_inter_j = min(int32_t(c_x + c_radius + 1.0f), (int32_t)end_j - 1);
-
-        // TODO: Handle that circle can cover partial pixels
-
         // Set flag
-        flag_arr[c] = (start_inter_i <= end_inter_i && start_inter_j <= end_inter_j);
+        flag_arr[c] = circle_intersects_rect(c_x, c_y, c_radius,
+            (float)start_j, (float)start_i,
+            float(end_j - 1), float(end_i - 1)
+        );
     }
 }
 
@@ -978,27 +988,6 @@ void launch_render(
 }
 
 } // namespace circles_gpu
-
-// How do we use that a circle is a bounding box telling you which pixels it touches?
-
-// Simple idea:
-// (1) Divide image into SM tiles
-// (2) Entire grid computes a scan of a boolean array similar to RLE for each tile over circles
-//     (a) 1 indicates a circle is in the tile; 0 if not (use the boundary of the tile to check)
-//     (b) Prefix sum indicates index in output of "runs"
-//     (c) The "start" of a run is the circle that's actually in the tile
-// (3) Now each tile has a list of only relevant circles
-// (4) At this point could simply have each thread handle a pixel and iterate over its tile's circles
-//     (a) Threads should handle pixels because then can accumulate results in registers and no need for atomic ops
-//     (b) Threads should work on tiles so load data for some circles SMEM->reg then use it for all the pixels
-//     (c) Tile's circles are in order but may not fit completely in SMEM, so need to buffer
-// (5) Alt: recursively scan?
-
-// Plan:
-// (1) Use RLE from lab7 to get relevant circles for each SM tile
-// (2) Simple SM-level impl: iterate over pixels and iterate over relevant circles
-// (3) Improve SM-level by thread tiling
-// (4) Improve SM-level by SMEM loading
 
 ////////////////////////////////////////////////////////////////////////////////
 ///          YOU DO NOT NEED TO MODIFY THE CODE BELOW HERE.                  ///
