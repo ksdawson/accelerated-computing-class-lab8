@@ -308,6 +308,7 @@ __device__ void warp_scan_handler(
 
 // 3-Kernel Parallel Algorithm
 template <typename Op, uint32_t VEC_SIZE, bool DO_FIX>
+__launch_bounds__(32*32)
 __global__ void local_scan(size_t n, typename Op::Data const *x, typename Op::Data *out, typename Op::Data *seed) {
     using Data = typename Op::Data;
     // Thread block info
@@ -344,6 +345,7 @@ __global__ void local_scan(size_t n, typename Op::Data const *x, typename Op::Da
     }
 }
 template <typename Op, uint32_t VEC_SIZE>
+__launch_bounds__(1*32)
 __global__ void hierarchical_scan(size_t n, typename Op::Data const *x, typename Op::Data *out) {
     warp_scan<Op, VEC_SIZE, true>(n, x, out, Op::identity());
 }
@@ -551,11 +553,11 @@ __device__ void scalar_create_flag_array(GmemCircles gmem_circles,
     }
 }
 template <typename Op>
+__launch_bounds__(32*32)
 __global__ void create_flag_array(GmemCircles gmem_circles,
     const uint32_t start_i, const uint32_t start_j, const uint32_t end_i, const uint32_t end_j,
     typename Op::Data *flag_arr
 ) {
-    // Take ~60ms
     // If size is less than vector size use scalar version
     if (gmem_circles.n_circle < 16) {
         scalar_create_flag_array<Op>(gmem_circles, start_i, start_j, end_i, end_j, flag_arr);
@@ -645,9 +647,8 @@ __device__ void scalar_extract_scan(GmemCircles gmem_circles, typename Op::Data 
     }
 }
 template <typename Op>
+__launch_bounds__(32*32)
 __global__ void extract_scan(GmemCircles gmem_circles, typename Op::Data *flag_arr, SmemCircles sm_gmem_circles) {
-    // Takes ~30ms
-
     // If size is less than vector size use scalar version
     if (gmem_circles.n_circle < 16) {
         scalar_extract_scan<Op>(gmem_circles, flag_arr, sm_gmem_circles);
