@@ -555,6 +555,7 @@ __global__ void create_flag_array(GmemCircles gmem_circles,
     const uint32_t start_i, const uint32_t start_j, const uint32_t end_i, const uint32_t end_j,
     typename Op::Data *flag_arr
 ) {
+    // Take ~60ms
     // If size is less than vector size use scalar version
     if (gmem_circles.n_circle < 16) {
         scalar_create_flag_array<Op>(gmem_circles, start_i, start_j, end_i, end_j, flag_arr);
@@ -608,7 +609,22 @@ __global__ void create_flag_array(GmemCircles gmem_circles,
 }
 
 template <typename Op>
-__global__ void extract_scan(GmemCircles gmem_circles, typename Op::Data *flag_arr, SmemCircles sm_gmem_circles) {
+__device__ void extract_scan_helper(GmemCircles gmem_circles, SmemCircles sm_gmem_circles,
+    const typename Op::Data prev, const typename Op::Data curr, const uint32_t c
+) {
+    if (prev != curr) { // Start of "run", of which the first is a circle in the tile
+        // Transfer circle from grid array to sm array
+        sm_gmem_circles.circle_x[curr - 1] = gmem_circles.circle_x[c];
+        sm_gmem_circles.circle_y[curr - 1] = gmem_circles.circle_y[c];
+        sm_gmem_circles.circle_radius[curr - 1] = gmem_circles.circle_radius[c];
+        sm_gmem_circles.circle_red[curr - 1] = gmem_circles.circle_red[c];
+        sm_gmem_circles.circle_green[curr - 1] = gmem_circles.circle_green[c];
+        sm_gmem_circles.circle_blue[curr - 1] = gmem_circles.circle_blue[c];
+        sm_gmem_circles.circle_alpha[curr - 1] = gmem_circles.circle_alpha[c];
+    }
+}
+template <typename Op>
+__device__ void scalar_extract_scan(GmemCircles gmem_circles, typename Op::Data *flag_arr, SmemCircles sm_gmem_circles) {
     using Data = typename Op::Data;
     if (blockIdx.x == 0 && threadIdx.x == 0) {
         if (flag_arr[0] == 1) {
@@ -625,16 +641,54 @@ __global__ void extract_scan(GmemCircles gmem_circles, typename Op::Data *flag_a
     for (uint32_t c = blockIdx.x * blockDim.x + threadIdx.x + 1; c < gmem_circles.n_circle; c += gridDim.x * blockDim.x) {
         const Data prev = flag_arr[c - 1];
         const Data curr = flag_arr[c];
-        if (prev != curr) { // Start of "run", of which the first is a circle in the tile
-            // Transfer circle from grid array to sm array
-            sm_gmem_circles.circle_x[curr - 1] = gmem_circles.circle_x[c];
-            sm_gmem_circles.circle_y[curr - 1] = gmem_circles.circle_y[c];
-            sm_gmem_circles.circle_radius[curr - 1] = gmem_circles.circle_radius[c];
-            sm_gmem_circles.circle_red[curr - 1] = gmem_circles.circle_red[c];
-            sm_gmem_circles.circle_green[curr - 1] = gmem_circles.circle_green[c];
-            sm_gmem_circles.circle_blue[curr - 1] = gmem_circles.circle_blue[c];
-            sm_gmem_circles.circle_alpha[curr - 1] = gmem_circles.circle_alpha[c];
+        extract_scan_helper<Op>(gmem_circles, sm_gmem_circles, prev, curr, c);
+    }
+}
+template <typename Op>
+__global__ void extract_scan(GmemCircles gmem_circles, typename Op::Data *flag_arr, SmemCircles sm_gmem_circles) {
+    // Takes ~30ms
+
+    // If size is less than vector size use scalar version
+    if (gmem_circles.n_circle < 16) {
+        scalar_extract_scan<Op>(gmem_circles, flag_arr, sm_gmem_circles);
+        return;
+    }
+
+    // Vectorize flag array
+    using Data = typename Op::Data;
+    using VecData = Vectorized<Data, 4>;
+    VecData *flag_arr4 = reinterpret_cast<VecData*>(flag_arr);
+
+    // Handle vectors
+    if (blockIdx.x == 0 && threadIdx.x == 0) {
+        const VecData curr = flag_arr4[0];
+        if (curr.elements[0] == 1) {
+            sm_gmem_circles.circle_x[0] = gmem_circles.circle_x[0];
+            sm_gmem_circles.circle_y[0] = gmem_circles.circle_y[0];
+            sm_gmem_circles.circle_radius[0] = gmem_circles.circle_radius[0];
+            sm_gmem_circles.circle_red[0] = gmem_circles.circle_red[0];
+            sm_gmem_circles.circle_green[0] = gmem_circles.circle_green[0];
+            sm_gmem_circles.circle_blue[0] = gmem_circles.circle_blue[0];
+            sm_gmem_circles.circle_alpha[0] = gmem_circles.circle_alpha[0];
         }
+        extract_scan_helper<Op>(gmem_circles, sm_gmem_circles, curr.elements[0], curr.elements[1], 1);
+        extract_scan_helper<Op>(gmem_circles, sm_gmem_circles, curr.elements[1], curr.elements[2], 2);
+        extract_scan_helper<Op>(gmem_circles, sm_gmem_circles, curr.elements[2], curr.elements[3], 3);
+    }
+    for (uint32_t vc = blockIdx.x * blockDim.x + threadIdx.x + 1; vc < gmem_circles.n_circle / 4; vc += gridDim.x * blockDim.x) {
+        const VecData prev = flag_arr4[vc - 1];
+        const VecData curr = flag_arr4[vc];
+        extract_scan_helper<Op>(gmem_circles, sm_gmem_circles, prev.elements[3], curr.elements[0], vc*4 + 0);
+        extract_scan_helper<Op>(gmem_circles, sm_gmem_circles, curr.elements[0], curr.elements[1], vc*4 + 1);
+        extract_scan_helper<Op>(gmem_circles, sm_gmem_circles, curr.elements[1], curr.elements[2], vc*4 + 2);
+        extract_scan_helper<Op>(gmem_circles, sm_gmem_circles, curr.elements[2], curr.elements[3], vc*4 + 3);
+    }
+
+    // Handle tail
+    for (uint32_t c = (gmem_circles.n_circle / 4) * 4 + (blockIdx.x * blockDim.x + threadIdx.x); c < gmem_circles.n_circle; c += gridDim.x * blockDim.x) {
+        const Data prev = flag_arr[c - 1];
+        const Data curr = flag_arr[c];
+        extract_scan_helper<Op>(gmem_circles, sm_gmem_circles, prev, curr, c);
     }
 }
 
@@ -926,7 +980,7 @@ void launch_specialized_kernel(
     float *img_red, float *img_green, float *img_blue,
     GpuMemoryPool &memory_pool
 ) {
-    // For each tile run a scan using the full grid to get the circles actually in the tile
+    // For each tile run a scan using the full grid to get the circles actually in the tile (takes ~75ms)
     const uint32_t smt_per_i = height / SM_TH;
     const uint32_t smt_per_j = width / SM_TW;
     const uint32_t num_tiles = smt_per_i * smt_per_j;
@@ -988,7 +1042,6 @@ void launch_specialized_kernel(
         Data last_run;
         CUDA_CHECK(cudaMemcpy(&last_run, &flag[gmem_circles.n_circle - 1], sizeof(Data), cudaMemcpyDeviceToHost));
         sm_gmem_circles.n_circle = last_run;
-        // printf("wxh, tile, n_circle: %dx%d, %d, %d\n", width, height, sm_idx, last_run);
 
         // Convert to GmemCircles
         GmemCircles const_sm_gmem_circles = {
