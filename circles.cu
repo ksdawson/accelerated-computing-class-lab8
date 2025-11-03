@@ -112,16 +112,6 @@ void render_cpu(
 ////////////////////////////////////////////////////////////////////////////////
 // Scan code
 
-struct SumOp {
-    using Data = uint32_t;
-
-    static __host__ __device__ __forceinline__ Data identity() { return 0; }
-
-    static __host__ __device__ __forceinline__ Data combine(Data a, Data b) {
-        return a + b;
-    }
-};
-
 /// Helpers to deal with Op::Data type
 // Generic, aligned struct for vectorized memory access
 template <typename T, int N>
@@ -385,6 +375,28 @@ typename Op::Data *launch_scan(
 ////////////////////////////////////////////////////////////////////////////////
 // Optimized GPU Implementation
 
+struct __align__(8) CircleData {
+    uint32_t v1;
+    uint32_t v2;
+};
+struct CircleOp {
+    using Data = CircleData;
+
+    static __host__ __device__ __forceinline__ Data identity() {
+        CircleData result;
+        result.v1 = 0;
+        result.v2 = 0;
+        return result;
+    }
+
+    static __host__ __device__ __forceinline__ Data combine(Data a, Data b) {
+        CircleData result;
+        result.v1 = a.v1 + b.v1;
+        result.v2 = a.v2 + b.v2;
+        return result;
+    }
+};
+
 // Generic helpers and data structures
 struct GmemCircles {
     const uint32_t n_circle;
@@ -527,14 +539,20 @@ __device__ bool circle_intersects_rect(
 // Scan code
 template <typename Op>
 __device__ void scalar_create_flag_array(GmemCircles gmem_circles,
-    const uint32_t start_i, const uint32_t start_j, const uint32_t end_i, const uint32_t end_j,
+    const uint32_t start1_i, const uint32_t start1_j, const uint32_t end1_i, const uint32_t end1_j,
+    const uint32_t start2_i, const uint32_t start2_j, const uint32_t end2_i, const uint32_t end2_j,
     typename Op::Data *flag_arr
 ) {
+    using Data = typename Op::Data;
     // Hoist tile bounds
-    const float start_jf = (float)start_j;
-    const float start_if = (float)start_i;
-    const float end_jf = float(end_j - 1);
-    const float end_if = float(end_i - 1);
+    const float start1_jf = (float)start1_j;
+    const float start1_if = (float)start1_i;
+    const float end1_jf = float(end1_j - 1);
+    const float end1_if = float(end1_i - 1);
+    const float start2_jf = (float)start2_j;
+    const float start2_if = (float)start2_i;
+    const float end2_jf = float(end2_j - 1);
+    const float end2_if = float(end2_i - 1);
 
     for (uint32_t c = blockIdx.x * blockDim.x + threadIdx.x; c < gmem_circles.n_circle; c += gridDim.x * blockDim.x) {
         // Scalar load circle
@@ -543,20 +561,22 @@ __device__ void scalar_create_flag_array(GmemCircles gmem_circles,
         const float c_radius = gmem_circles.circle_radius[c];
 
         // Set flag
-        flag_arr[c] = circle_intersects_rect(c_x, c_y, c_radius,
-            start_jf, start_if, end_jf, end_if
-        );
+        Data result;
+        result.v1 = circle_intersects_rect(c_x, c_y, c_radius, start1_jf, start1_if, end1_jf, end1_if);
+        result.v2 = circle_intersects_rect(c_x, c_y, c_radius, start2_jf, start2_if, end2_jf, end2_if);
+        flag_arr[c] = result;
     }
 }
 template <typename Op>
 __launch_bounds__(32*32)
 __global__ void create_flag_array(GmemCircles gmem_circles,
-    const uint32_t start_i, const uint32_t start_j, const uint32_t end_i, const uint32_t end_j,
+    const uint32_t start1_i, const uint32_t start1_j, const uint32_t end1_i, const uint32_t end1_j,
+    const uint32_t start2_i, const uint32_t start2_j, const uint32_t end2_i, const uint32_t end2_j,
     typename Op::Data *flag_arr
 ) {
     // If size is less than vector size use scalar version
     if (gmem_circles.n_circle < 16) {
-        scalar_create_flag_array<Op>(gmem_circles, start_i, start_j, end_i, end_j, flag_arr);
+        scalar_create_flag_array<Op>(gmem_circles, start1_i, start1_j, end1_i, end1_j, start2_i, start2_j, end2_i, end2_j, flag_arr);
         return;
     }
 
@@ -567,14 +587,19 @@ __global__ void create_flag_array(GmemCircles gmem_circles,
 
     // Vectorize flag array
     using Data = typename Op::Data;
-    using VecData = Vectorized<Data, 4>;
-    VecData *flag_arr4 = reinterpret_cast<VecData*>(flag_arr);
+    using VecData = Vectorized<Data, 2>;
+    VecData *flag_arr2 = reinterpret_cast<VecData*>(flag_arr);
 
     // Hoist tile bounds
-    const float start_jf = (float)start_j;
-    const float start_if = (float)start_i;
-    const float end_jf = float(end_j - 1);
-    const float end_if = float(end_i - 1);
+    const float start1_jf = (float)start1_j;
+    const float start1_if = (float)start1_i;
+    const float end1_jf = float(end1_j - 1);
+    const float end1_if = float(end1_i - 1);
+
+    const float start2_jf = (float)start2_j;
+    const float start2_if = (float)start2_i;
+    const float end2_jf = float(end2_j - 1);
+    const float end2_if = float(end2_i - 1);
 
     // Handle vectors
     for (uint32_t vc = blockIdx.x * blockDim.x + threadIdx.x; vc < gmem_circles.n_circle / 4; vc += gridDim.x * blockDim.x) {
@@ -584,12 +609,27 @@ __global__ void create_flag_array(GmemCircles gmem_circles,
         const float4 c_radius4 = gmem_circle_radius4[vc];
 
         // Set flags
-        VecData result;
-        result.elements[0] = circle_intersects_rect(c_x4.x, c_y4.x, c_radius4.x, start_jf, start_if, end_jf, end_if);
-        result.elements[1] = circle_intersects_rect(c_x4.y, c_y4.y, c_radius4.y, start_jf, start_if, end_jf, end_if);
-        result.elements[2] = circle_intersects_rect(c_x4.z, c_y4.z, c_radius4.z, start_jf, start_if, end_jf, end_if);
-        result.elements[3] = circle_intersects_rect(c_x4.w, c_y4.w, c_radius4.w, start_jf, start_if, end_jf, end_if);
-        flag_arr4[vc] = result;
+        VecData result1;
+        Data rx1;
+        Data ry1;
+        rx1.v1 = circle_intersects_rect(c_x4.x, c_y4.x, c_radius4.x, start1_jf, start1_if, end1_jf, end1_if);
+        rx1.v2 = circle_intersects_rect(c_x4.x, c_y4.x, c_radius4.x, start2_jf, start2_if, end2_jf, end2_if);
+        ry1.v1 = circle_intersects_rect(c_x4.y, c_y4.y, c_radius4.y, start1_jf, start1_if, end1_jf, end1_if);
+        ry1.v2 = circle_intersects_rect(c_x4.y, c_y4.y, c_radius4.y, start2_jf, start2_if, end2_jf, end2_if);
+        result1.elements[0] = rx1;
+        result1.elements[1] = ry1;
+        flag_arr2[vc * 2] = result1;
+
+        VecData result2;
+        Data rx2;
+        Data ry2;
+        rx2.v1 = circle_intersects_rect(c_x4.z, c_y4.z, c_radius4.z, start1_jf, start1_if, end1_jf, end1_if);
+        rx2.v2 = circle_intersects_rect(c_x4.z, c_y4.z, c_radius4.z, start2_jf, start2_if, end2_jf, end2_if);
+        ry2.v1 = circle_intersects_rect(c_x4.w, c_y4.w, c_radius4.w, start1_jf, start1_if, end1_jf, end1_if);
+        ry2.v2 = circle_intersects_rect(c_x4.w, c_y4.w, c_radius4.w, start2_jf, start2_if, end2_jf, end2_if);
+        result2.elements[0] = rx2;
+        result2.elements[1] = ry2;
+        flag_arr2[vc * 2 + 1] = result2;
     }
 
     // Handle tail
@@ -600,15 +640,15 @@ __global__ void create_flag_array(GmemCircles gmem_circles,
         const float c_radius = gmem_circles.circle_radius[c];
 
         // Set flag
-        flag_arr[c] = circle_intersects_rect(c_x, c_y, c_radius,
-            start_jf, start_if, end_jf, end_if
-        );
+        Data result;
+        result.v1 = circle_intersects_rect(c_x, c_y, c_radius, start1_jf, start1_if, end1_jf, end1_if);
+        result.v2 = circle_intersects_rect(c_x, c_y, c_radius, start2_jf, start2_if, end2_jf, end2_if);
+        flag_arr[c] = result;
     }
 }
 
-template <typename Op>
 __device__ void extract_scan_helper(GmemCircles gmem_circles, SmemCircles sm_gmem_circles,
-    const typename Op::Data prev, const typename Op::Data curr, const uint32_t c
+    const uint32_t prev, const uint32_t curr, const uint32_t c
 ) {
     if (prev != curr) { // Start of "run", of which the first is a circle in the tile
         // Transfer circle from grid array to sm array
@@ -622,70 +662,90 @@ __device__ void extract_scan_helper(GmemCircles gmem_circles, SmemCircles sm_gme
     }
 }
 template <typename Op>
-__device__ void scalar_extract_scan(GmemCircles gmem_circles, typename Op::Data *flag_arr, SmemCircles sm_gmem_circles) {
+__device__ void scalar_extract_scan(GmemCircles gmem_circles, typename Op::Data *flag_arr, SmemCircles sm_gmem_circles1, SmemCircles sm_gmem_circles2) {
     using Data = typename Op::Data;
     if (blockIdx.x == 0 && threadIdx.x == 0) {
-        if (flag_arr[0] == 1) {
+        Data curr = flag_arr[0];
+        if (curr.v1 == 1) {
             // Transfer circle from grid array to sm array
-            sm_gmem_circles.circle_x[0] = gmem_circles.circle_x[0];
-            sm_gmem_circles.circle_y[0] = gmem_circles.circle_y[0];
-            sm_gmem_circles.circle_radius[0] = gmem_circles.circle_radius[0];
-            sm_gmem_circles.circle_red[0] = gmem_circles.circle_red[0];
-            sm_gmem_circles.circle_green[0] = gmem_circles.circle_green[0];
-            sm_gmem_circles.circle_blue[0] = gmem_circles.circle_blue[0];
-            sm_gmem_circles.circle_alpha[0] = gmem_circles.circle_alpha[0];
+            sm_gmem_circles1.circle_x[0] = gmem_circles.circle_x[0];
+            sm_gmem_circles1.circle_y[0] = gmem_circles.circle_y[0];
+            sm_gmem_circles1.circle_radius[0] = gmem_circles.circle_radius[0];
+            sm_gmem_circles1.circle_red[0] = gmem_circles.circle_red[0];
+            sm_gmem_circles1.circle_green[0] = gmem_circles.circle_green[0];
+            sm_gmem_circles1.circle_blue[0] = gmem_circles.circle_blue[0];
+            sm_gmem_circles1.circle_alpha[0] = gmem_circles.circle_alpha[0];
+        }
+        if (curr.v2 == 1) {
+            sm_gmem_circles2.circle_x[0] = gmem_circles.circle_x[0];
+            sm_gmem_circles2.circle_y[0] = gmem_circles.circle_y[0];
+            sm_gmem_circles2.circle_radius[0] = gmem_circles.circle_radius[0];
+            sm_gmem_circles2.circle_red[0] = gmem_circles.circle_red[0];
+            sm_gmem_circles2.circle_green[0] = gmem_circles.circle_green[0];
+            sm_gmem_circles2.circle_blue[0] = gmem_circles.circle_blue[0];
+            sm_gmem_circles2.circle_alpha[0] = gmem_circles.circle_alpha[0];
         }
     }
     for (uint32_t c = blockIdx.x * blockDim.x + threadIdx.x + 1; c < gmem_circles.n_circle; c += gridDim.x * blockDim.x) {
         const Data prev = flag_arr[c - 1];
         const Data curr = flag_arr[c];
-        extract_scan_helper<Op>(gmem_circles, sm_gmem_circles, prev, curr, c);
+        extract_scan_helper(gmem_circles, sm_gmem_circles1, prev.v1, curr.v1, c);
+        extract_scan_helper(gmem_circles, sm_gmem_circles2, prev.v2, curr.v2, c);
     }
 }
 template <typename Op>
 __launch_bounds__(32*32)
-__global__ void extract_scan(GmemCircles gmem_circles, typename Op::Data *flag_arr, SmemCircles sm_gmem_circles) {
+__global__ void extract_scan(GmemCircles gmem_circles, typename Op::Data *flag_arr, SmemCircles sm_gmem_circles1, SmemCircles sm_gmem_circles2) {
     // If size is less than vector size use scalar version
     if (gmem_circles.n_circle < 16) {
-        scalar_extract_scan<Op>(gmem_circles, flag_arr, sm_gmem_circles);
+        scalar_extract_scan<Op>(gmem_circles, flag_arr, sm_gmem_circles1, sm_gmem_circles2);
         return;
     }
 
     // Vectorize flag array
     using Data = typename Op::Data;
-    using VecData = Vectorized<Data, 4>;
-    VecData *flag_arr4 = reinterpret_cast<VecData*>(flag_arr);
+    using VecData = Vectorized<Data, 2>;
+    VecData *flag_arr2 = reinterpret_cast<VecData*>(flag_arr);
 
     // Handle vectors
     if (blockIdx.x == 0 && threadIdx.x == 0) {
-        const VecData curr = flag_arr4[0];
-        if (curr.elements[0] == 1) {
-            sm_gmem_circles.circle_x[0] = gmem_circles.circle_x[0];
-            sm_gmem_circles.circle_y[0] = gmem_circles.circle_y[0];
-            sm_gmem_circles.circle_radius[0] = gmem_circles.circle_radius[0];
-            sm_gmem_circles.circle_red[0] = gmem_circles.circle_red[0];
-            sm_gmem_circles.circle_green[0] = gmem_circles.circle_green[0];
-            sm_gmem_circles.circle_blue[0] = gmem_circles.circle_blue[0];
-            sm_gmem_circles.circle_alpha[0] = gmem_circles.circle_alpha[0];
+        const VecData curr = flag_arr2[0];
+        if (curr.elements[0].v1 == 1) {
+            sm_gmem_circles1.circle_x[0] = gmem_circles.circle_x[0];
+            sm_gmem_circles1.circle_y[0] = gmem_circles.circle_y[0];
+            sm_gmem_circles1.circle_radius[0] = gmem_circles.circle_radius[0];
+            sm_gmem_circles1.circle_red[0] = gmem_circles.circle_red[0];
+            sm_gmem_circles1.circle_green[0] = gmem_circles.circle_green[0];
+            sm_gmem_circles1.circle_blue[0] = gmem_circles.circle_blue[0];
+            sm_gmem_circles1.circle_alpha[0] = gmem_circles.circle_alpha[0];
         }
-        extract_scan_helper<Op>(gmem_circles, sm_gmem_circles, curr.elements[0], curr.elements[1], 1);
-        extract_scan_helper<Op>(gmem_circles, sm_gmem_circles, curr.elements[1], curr.elements[2], 2);
-        extract_scan_helper<Op>(gmem_circles, sm_gmem_circles, curr.elements[2], curr.elements[3], 3);
+        if (curr.elements[0].v2 == 1) {
+            sm_gmem_circles2.circle_x[0] = gmem_circles.circle_x[0];
+            sm_gmem_circles2.circle_y[0] = gmem_circles.circle_y[0];
+            sm_gmem_circles2.circle_radius[0] = gmem_circles.circle_radius[0];
+            sm_gmem_circles2.circle_red[0] = gmem_circles.circle_red[0];
+            sm_gmem_circles2.circle_green[0] = gmem_circles.circle_green[0];
+            sm_gmem_circles2.circle_blue[0] = gmem_circles.circle_blue[0];
+            sm_gmem_circles2.circle_alpha[0] = gmem_circles.circle_alpha[0];
+        }
+        extract_scan_helper(gmem_circles, sm_gmem_circles1, curr.elements[0].v1, curr.elements[1].v1, 1);
+        extract_scan_helper(gmem_circles, sm_gmem_circles2, curr.elements[0].v2, curr.elements[1].v2, 1);
     }
-    for (uint32_t vc = blockIdx.x * blockDim.x + threadIdx.x + 1; vc < gmem_circles.n_circle / 4; vc += gridDim.x * blockDim.x) {
-        const VecData prev = flag_arr4[vc - 1];
-        const VecData curr = flag_arr4[vc];
-        extract_scan_helper<Op>(gmem_circles, sm_gmem_circles, prev.elements[3], curr.elements[0], vc*4 + 0);
-        extract_scan_helper<Op>(gmem_circles, sm_gmem_circles, curr.elements[0], curr.elements[1], vc*4 + 1);
-        extract_scan_helper<Op>(gmem_circles, sm_gmem_circles, curr.elements[1], curr.elements[2], vc*4 + 2);
-        extract_scan_helper<Op>(gmem_circles, sm_gmem_circles, curr.elements[2], curr.elements[3], vc*4 + 3);
+    for (uint32_t vc = blockIdx.x * blockDim.x + threadIdx.x + 1; vc < gmem_circles.n_circle / 2; vc += gridDim.x * blockDim.x) {
+        const VecData prev = flag_arr2[vc - 1];
+        const VecData curr = flag_arr2[vc];
+        extract_scan_helper(gmem_circles, sm_gmem_circles1, prev.elements[1].v1, curr.elements[0].v1, vc*2 + 0);
+        extract_scan_helper(gmem_circles, sm_gmem_circles1, curr.elements[0].v1, curr.elements[1].v1, vc*2 + 1);
+        extract_scan_helper(gmem_circles, sm_gmem_circles2, prev.elements[1].v2, curr.elements[0].v2, vc*2 + 0);
+        extract_scan_helper(gmem_circles, sm_gmem_circles2, curr.elements[0].v2, curr.elements[1].v2, vc*2 + 1);
     }
 
     // Handle tail
-    for (uint32_t c = (gmem_circles.n_circle / 4) * 4 + (blockIdx.x * blockDim.x + threadIdx.x); c < gmem_circles.n_circle; c += gridDim.x * blockDim.x) {
+    for (uint32_t c = (gmem_circles.n_circle / 2) * 2 + (blockIdx.x * blockDim.x + threadIdx.x); c < gmem_circles.n_circle; c += gridDim.x * blockDim.x) {
         const Data prev = flag_arr[c - 1];
         const Data curr = flag_arr[c];
-        extract_scan_helper<Op>(gmem_circles, sm_gmem_circles, prev, curr, c);
+        extract_scan_helper(gmem_circles, sm_gmem_circles1, prev.v1, curr.v1, c);
+        extract_scan_helper(gmem_circles, sm_gmem_circles2, prev.v2, curr.v2, c);
     }
 }
 
@@ -1013,7 +1073,7 @@ void launch_specialized_kernel(
     const uint32_t num_tiles = smt_per_i * smt_per_j;
 
     // Extra gmem sizes
-    using Data = typename SumOp::Data;
+    using Data = typename CircleOp::Data;
     const size_t scan_size = 48 * 32 * sizeof(Data);
     const size_t flag_arr_size = gmem_circles.n_circle * sizeof(Data);
     const uint32_t num_circles = gmem_circles.n_circle; // The max number of circles per tile -> tune
@@ -1028,62 +1088,91 @@ void launch_specialized_kernel(
     GmemCircles *sm_gmem_circles_arr = reinterpret_cast<GmemCircles*>(memory_pool.alloc(sm_gmem_circles_size));
 
     // Iterate over SM tiles
-    for (uint32_t sm_idx = 0; sm_idx < num_tiles; ++sm_idx) {
+    for (uint32_t idx = 0; idx < num_tiles / 2; ++idx) {
+        const uint32_t sm_idx = idx * 2;
 
         // Setup sm_gmem_circles
-        const uint32_t tile_offset = sm_idx * (7 * num_circles_aligned);
-        float *sm_gmem_circles_workspace = sm_gmem_circles_workspaces + tile_offset;
-        SmemCircles sm_gmem_circles = {0, // Set n_circle after scan
-            sm_gmem_circles_workspace + 0 * num_circles_aligned,
-            sm_gmem_circles_workspace + 1 * num_circles_aligned,
-            sm_gmem_circles_workspace + 2 * num_circles_aligned,
-            sm_gmem_circles_workspace + 3 * num_circles_aligned,
-            sm_gmem_circles_workspace + 4 * num_circles_aligned,
-            sm_gmem_circles_workspace + 5 * num_circles_aligned,
-            sm_gmem_circles_workspace + 6 * num_circles_aligned
+        float *sm_gmem_circles_workspace1 = sm_gmem_circles_workspaces + sm_idx * (7 * num_circles_aligned);
+        SmemCircles sm_gmem_circles1 = {0, // Set n_circle after scan
+            sm_gmem_circles_workspace1 + 0 * num_circles_aligned,
+            sm_gmem_circles_workspace1 + 1 * num_circles_aligned,
+            sm_gmem_circles_workspace1 + 2 * num_circles_aligned,
+            sm_gmem_circles_workspace1 + 3 * num_circles_aligned,
+            sm_gmem_circles_workspace1 + 4 * num_circles_aligned,
+            sm_gmem_circles_workspace1 + 5 * num_circles_aligned,
+            sm_gmem_circles_workspace1 + 6 * num_circles_aligned
+        };
+        float *sm_gmem_circles_workspace2 = sm_gmem_circles_workspaces + (sm_idx + 1) * (7 * num_circles_aligned);
+        SmemCircles sm_gmem_circles2 = {0,
+            sm_gmem_circles_workspace2 + 0 * num_circles_aligned,
+            sm_gmem_circles_workspace2 + 1 * num_circles_aligned,
+            sm_gmem_circles_workspace2 + 2 * num_circles_aligned,
+            sm_gmem_circles_workspace2 + 3 * num_circles_aligned,
+            sm_gmem_circles_workspace2 + 4 * num_circles_aligned,
+            sm_gmem_circles_workspace2 + 5 * num_circles_aligned,
+            sm_gmem_circles_workspace2 + 6 * num_circles_aligned
         };
 
         // SM tile indices
-        const uint32_t smt_i = sm_idx / smt_per_j;
-        const uint32_t smt_j = sm_idx % smt_per_j;
+        const uint32_t smt1_i = sm_idx / smt_per_j;
+        const uint32_t smt1_j = sm_idx % smt_per_j;
+        const uint32_t smt2_i = (sm_idx + 1) / smt_per_j;
+        const uint32_t smt2_j = (sm_idx + 1) % smt_per_j;
 
         // Get tile bounds
-        const uint32_t start_i = smt_i * SM_TH;
-        const uint32_t start_j = smt_j * SM_TW;
-        const uint32_t end_i = start_i + SM_TH;
-        const uint32_t end_j = start_j + SM_TW;
+        const uint32_t start1_i = smt1_i * SM_TH;
+        const uint32_t start1_j = smt1_j * SM_TW;
+        const uint32_t end1_i = start1_i + SM_TH;
+        const uint32_t end1_j = start1_j + SM_TW;
+        const uint32_t start2_i = smt2_i * SM_TH;
+        const uint32_t start2_j = smt2_j * SM_TW;
+        const uint32_t end2_i = start2_i + SM_TH;
+        const uint32_t end2_j = start2_j + SM_TW;
 
         // Create flag array
-        create_flag_array<SumOp><<<48, 32*32>>>(gmem_circles,
-            start_i, start_j, end_i, end_j,
+        create_flag_array<CircleOp><<<48, 32*32>>>(gmem_circles,
+            start1_i, start1_j, end1_i, end1_j,
+            start2_i, start2_j, end2_i, end2_j,
             flag
         );
 
         // Run scan on flag array
-        scan_gpu::launch_scan<SumOp>(gmem_circles.n_circle, flag, seed);
+        scan_gpu::launch_scan<CircleOp>(gmem_circles.n_circle, flag, seed);
 
         // Extract scan
-        extract_scan<SumOp><<<48, 32*32>>>(gmem_circles, flag, sm_gmem_circles);
+        extract_scan<CircleOp><<<48, 32*32>>>(gmem_circles, flag, sm_gmem_circles1, sm_gmem_circles2);
 
         // Set n_circle
         Data last_run;
         CUDA_CHECK(cudaMemcpy(&last_run, &flag[gmem_circles.n_circle - 1], sizeof(Data), cudaMemcpyDeviceToHost));
-        sm_gmem_circles.n_circle = last_run;
+        sm_gmem_circles1.n_circle = last_run.v1;
+        sm_gmem_circles2.n_circle = last_run.v2;
 
         // Convert to GmemCircles
-        GmemCircles const_sm_gmem_circles = {
-            sm_gmem_circles.n_circle,
-            sm_gmem_circles.circle_x,
-            sm_gmem_circles.circle_y,
-            sm_gmem_circles.circle_radius,
-            sm_gmem_circles.circle_red,
-            sm_gmem_circles.circle_green,
-            sm_gmem_circles.circle_blue,
-            sm_gmem_circles.circle_alpha
+        GmemCircles const_sm_gmem_circles1 = {
+            sm_gmem_circles1.n_circle,
+            sm_gmem_circles1.circle_x,
+            sm_gmem_circles1.circle_y,
+            sm_gmem_circles1.circle_radius,
+            sm_gmem_circles1.circle_red,
+            sm_gmem_circles1.circle_green,
+            sm_gmem_circles1.circle_blue,
+            sm_gmem_circles1.circle_alpha
+        };
+        GmemCircles const_sm_gmem_circles2 = {
+            sm_gmem_circles2.n_circle,
+            sm_gmem_circles2.circle_x,
+            sm_gmem_circles2.circle_y,
+            sm_gmem_circles2.circle_radius,
+            sm_gmem_circles2.circle_red,
+            sm_gmem_circles2.circle_green,
+            sm_gmem_circles2.circle_blue,
+            sm_gmem_circles2.circle_alpha
         };
 
         // Store sm_gmem_circles in gpu memory
-        CUDA_CHECK(cudaMemcpy(&sm_gmem_circles_arr[sm_idx], &const_sm_gmem_circles, sizeof(GmemCircles), cudaMemcpyHostToDevice));
+        CUDA_CHECK(cudaMemcpy(&sm_gmem_circles_arr[sm_idx], &const_sm_gmem_circles1, sizeof(GmemCircles), cudaMemcpyHostToDevice));
+        CUDA_CHECK(cudaMemcpy(&sm_gmem_circles_arr[sm_idx + 1], &const_sm_gmem_circles2, sizeof(GmemCircles), cudaMemcpyHostToDevice));
     }
 
     // Launch render kernel
