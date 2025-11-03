@@ -707,20 +707,22 @@ __device__ void thread_level_render_helper(
     const int32_t end_inter_j = min(int32_t(c_x + c_radius + 1.0f), (int32_t)end_j - 1);
 
     // Iterate over relevant pixels
+    const float r2 = c_radius * c_radius;
     for (int32_t i = start_inter_i; i <= end_inter_i; ++i) {
         for (int32_t j = start_inter_j; j <= end_inter_j; ++j) {
             // Handle that circle can cover partial pixels
             const float dy = i - c_y;
             const float dx = j - c_x;
-            if (!(dx * dx + dy * dy < c_radius * c_radius)) {
+            if (!(dx * dx + dy * dy < r2)) {
                 continue;
             }
 
             // Update pixel
             const int32_t p = (i - (int32_t)start_i) * T_TW + (j - (int32_t)start_j);
-            thread_img_red[p] = thread_img_red[p] * (1.0f - c_alpha) + c_red * c_alpha;
-            thread_img_green[p] = thread_img_green[p] * (1.0f - c_alpha) + c_green * c_alpha;
-            thread_img_blue[p] = thread_img_blue[p] * (1.0f - c_alpha) + c_blue * c_alpha;
+            const float dc_alpha = 1.0f - c_alpha;
+            thread_img_red[p] = thread_img_red[p] * dc_alpha + c_red * c_alpha;
+            thread_img_green[p] = thread_img_green[p] * dc_alpha + c_green * c_alpha;
+            thread_img_blue[p] = thread_img_blue[p] * dc_alpha + c_blue * c_alpha;
         }
     }
 }
@@ -845,7 +847,7 @@ __device__ void sm_level_render_helper(
 
     // Write back to main memory at the end
     #pragma unroll
-        for (uint32_t p = 0; p < T_TH * T_TW; ++p) {
+    for (uint32_t p = 0; p < T_TH * T_TW; ++p) {
         // Convert 1D to 2D indices
         const uint32_t i = tt_start_i + p / T_TW;
         const uint32_t j = tt_start_j + p % T_TW;
