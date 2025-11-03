@@ -728,6 +728,9 @@ __device__ void sm_level_render_helper(
         img_green[i * width + j] = tt_img_green[p];
         img_blue[i * width + j] = tt_img_blue[p];
     }
+
+    // Make sure the whole tile is done before moving on
+    __syncthreads();
 }
 
 template <uint32_t SM_TH, uint32_t SM_TW, uint32_t T_TH, uint32_t T_TW>
@@ -837,10 +840,6 @@ __global__ void gpu_level_render(
         const uint32_t smt_i = sm_idx / smt_per_j;
         const uint32_t smt_j = sm_idx % smt_per_j;
 
-        // if (threadIdx.x == 0 && sm_idx <= 15) {
-        //     printf("tile, n: %d, %d\n", sm_idx, sm_gmem_circles_arr[sm_idx].n_circle);
-        // }
-
         // Process tile
         sm_level_render<SM_TH, SM_TW, T_TH, T_TW>(width, height, sm_gmem_circles_arr[sm_idx], smem_circles,
             img_red, img_green, img_blue,
@@ -878,11 +877,6 @@ void launch_specialized_kernel(
 
     // Iterate over SM tiles
     for (uint32_t sm_idx = 0; sm_idx < num_tiles; ++sm_idx) {
-        if (sm_idx <= 15) {
-            GmemCircles const_sm_gmem_circles = gmem_circles;
-            CUDA_CHECK(cudaMemcpy(&sm_gmem_circles_arr[sm_idx], &const_sm_gmem_circles, sizeof(GmemCircles), cudaMemcpyHostToDevice));
-            continue;
-        }
 
         // Setup sm_gmem_circles
         const uint32_t tile_offset = sm_idx * (7 * num_circles_aligned);
@@ -894,7 +888,7 @@ void launch_specialized_kernel(
             sm_gmem_circles_workspace + 3 * num_circles_aligned,
             sm_gmem_circles_workspace + 4 * num_circles_aligned,
             sm_gmem_circles_workspace + 5 * num_circles_aligned,
-            sm_gmem_circles_workspace + 6 * num_circles_aligned,
+            sm_gmem_circles_workspace + 6 * num_circles_aligned
         };
 
         // SM tile indices
