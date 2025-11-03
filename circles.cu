@@ -878,6 +878,12 @@ void launch_specialized_kernel(
 
     // Iterate over SM tiles
     for (uint32_t sm_idx = 0; sm_idx < num_tiles; ++sm_idx) {
+        if (sm_idx <= 15) {
+            GmemCircles const_sm_gmem_circles = gmem_circles;
+            CUDA_CHECK(cudaMemcpy(&sm_gmem_circles_arr[sm_idx], &const_sm_gmem_circles, sizeof(GmemCircles), cudaMemcpyHostToDevice));
+            continue;
+        }
+
         // Setup sm_gmem_circles
         const uint32_t tile_offset = sm_idx * (7 * num_circles_aligned);
         float *sm_gmem_circles_workspace = sm_gmem_circles_workspaces + tile_offset;
@@ -920,25 +926,19 @@ void launch_specialized_kernel(
         // printf("wxh, tile, n_circle: %dx%d, %d, %d\n", width, height, sm_idx, last_run);
 
         // Convert to GmemCircles
-        if (sm_idx > 15) {
-            GmemCircles const_sm_gmem_circles = {
-                sm_gmem_circles.n_circle,
-                sm_gmem_circles.circle_x,
-                sm_gmem_circles.circle_y,
-                sm_gmem_circles.circle_radius,
-                sm_gmem_circles.circle_red,
-                sm_gmem_circles.circle_green,
-                sm_gmem_circles.circle_blue,
-                sm_gmem_circles.circle_alpha
-            };
-            CUDA_CHECK(cudaMemcpy(&sm_gmem_circles_arr[sm_idx], &const_sm_gmem_circles, sizeof(GmemCircles), cudaMemcpyHostToDevice));
-        } else {
-            GmemCircles const_sm_gmem_circles = gmem_circles;
-            CUDA_CHECK(cudaMemcpy(&sm_gmem_circles_arr[sm_idx], &const_sm_gmem_circles, sizeof(GmemCircles), cudaMemcpyHostToDevice));
-        }
+        GmemCircles const_sm_gmem_circles = {
+            sm_gmem_circles.n_circle,
+            sm_gmem_circles.circle_x,
+            sm_gmem_circles.circle_y,
+            sm_gmem_circles.circle_radius,
+            sm_gmem_circles.circle_red,
+            sm_gmem_circles.circle_green,
+            sm_gmem_circles.circle_blue,
+            sm_gmem_circles.circle_alpha
+        };
 
         // Store sm_gmem_circles in gpu memory
-        // CUDA_CHECK(cudaMemcpy(&sm_gmem_circles_arr[sm_idx], &const_sm_gmem_circles, sizeof(GmemCircles), cudaMemcpyHostToDevice));
+        CUDA_CHECK(cudaMemcpy(&sm_gmem_circles_arr[sm_idx], &const_sm_gmem_circles, sizeof(GmemCircles), cudaMemcpyHostToDevice));
     }
 
     // Launch render kernel
