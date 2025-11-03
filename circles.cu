@@ -815,9 +815,7 @@ __device__ void sm_level_render_helper(
     const uint32_t num_blocks = gmem_circles.n_circle / smem_circles_compute.n_circle;
     if (num_blocks > 0) {
         // Load first buffer sync
-        load_circles_async(gmem_circles, smem_circles_compute, 0);
-        __pipeline_wait_prior(0);
-        __syncthreads();
+        load_circles(gmem_circles, smem_circles_compute, 0);
 
         // Iterate over SMEM size chunks of circles
         for (uint32_t idx = 0; idx < num_blocks - 1; ++idx) {
