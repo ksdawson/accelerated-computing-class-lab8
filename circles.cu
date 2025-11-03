@@ -110,6 +110,277 @@ void render_cpu(
 /// <--- your code here --->
 
 ////////////////////////////////////////////////////////////////////////////////
+// Scan code
+
+struct SumOp {
+    using Data = uint32_t;
+
+    static __host__ __device__ __forceinline__ Data identity() { return 0; }
+
+    static __host__ __device__ __forceinline__ Data combine(Data a, Data b) {
+        return a + b;
+    }
+};
+
+/// Helpers to deal with Op::Data type
+// Generic, aligned struct for vectorized memory access
+template <typename T, int N>
+struct alignas(sizeof(T) * N) Vectorized {
+    T elements[N];
+};
+// Needed because compiler doesn't know how to shuffle DebugRange
+template <typename T>
+__device__ T shfl_up_any(T val, unsigned int delta) {
+    T result;
+    if constexpr (sizeof(T) == 4) {
+        // Single 32-bit value
+        uint32_t v = *reinterpret_cast<uint32_t*>(&val);
+        v = __shfl_up_sync(0xffffffff, v, delta);
+        *reinterpret_cast<uint32_t*>(&result) = v;
+    } else {
+        // Two 32-bit values (e.g. DebugRange)
+        const uint32_t* src = reinterpret_cast<const uint32_t*>(&val);
+        uint32_t* dst = reinterpret_cast<uint32_t*>(&result);
+        dst[0] = __shfl_up_sync(0xffffffff, src[0], delta);
+        dst[1] = __shfl_up_sync(0xffffffff, src[1], delta);
+    }
+    return result;
+}
+template <typename T>
+__device__ T shfl_down_any(T val, unsigned int delta) {
+    T result;
+    if constexpr (sizeof(T) == 4) {
+        // Single 32-bit value
+        uint32_t v = *reinterpret_cast<uint32_t*>(&val);
+        v = __shfl_down_sync(0xffffffff, v, delta);
+        *reinterpret_cast<uint32_t*>(&result) = v;
+    } else {
+        // Two 32-bit values (e.g. DebugRange)
+        const uint32_t* src = reinterpret_cast<const uint32_t*>(&val);
+        uint32_t* dst = reinterpret_cast<uint32_t*>(&result);
+        dst[0] = __shfl_down_sync(0xffffffff, src[0], delta);
+        dst[1] = __shfl_down_sync(0xffffffff, src[1], delta);
+    }
+    return result;
+}
+
+namespace scan_gpu {
+
+// Helpers
+template <typename Op>
+__device__ typename Op::Data warp_local_scan(typename Op::Data val) {
+    using Data = typename Op::Data;
+
+    // Computes parallel prefix on 32 elements using Hillis Steele Scan w/ warp shuffle
+    const uint32_t thread_idx = threadIdx.x % 32;
+    uint32_t idx = 1;
+    for (uint32_t step = 0; step < 5; ++step) { // log2(32) = 5
+        // Load prefix from register
+        Data tmp = shfl_up_any(val, idx);
+        tmp = (thread_idx >= idx) ? tmp : Op::identity(); // Mask out
+
+        // Update prefix in register
+        val = Op::combine(tmp, val);
+
+        // Multiply idx by 2
+        idx <<= 1;
+    }
+
+    return val;
+}
+
+template <typename Op, uint32_t VEC_SIZE, bool DO_FIX>
+__device__ inline typename Op::Data thread_local_scan(size_t n, typename Op::Data const *x, typename Op::Data *out,
+    const uint32_t start_i, const uint32_t end_i,
+    typename Op::Data accumulator
+) {
+    using Data = typename Op::Data;
+    using VecData = Vectorized<Data, VEC_SIZE>;
+
+    // Vectorize
+    VecData const *vx = reinterpret_cast<VecData const *>(x);
+    VecData *vout = reinterpret_cast<VecData*>(out);
+    const uint32_t start_vi = start_i / VEC_SIZE;
+    const uint32_t end_vi = end_i / VEC_SIZE;
+
+    // Local scan
+    for (uint32_t i = start_vi; i < end_vi; ++i) {
+        VecData v = vx[i];
+        #pragma unroll
+        for (uint32_t vi = 0; vi < VEC_SIZE; ++vi) {
+            accumulator = Op::combine(accumulator, v.elements[vi]);
+            v.elements[vi] = accumulator;
+        }
+        // Output to memory
+        if constexpr (DO_FIX) { vout[i] = v; }
+    }
+    // Handle vector tail
+    const uint32_t start_scalar_i = end_vi * VEC_SIZE;
+    for (uint32_t i = start_scalar_i; i < end_i; ++i) {
+        accumulator = Op::combine(accumulator, x[i]);
+        if constexpr (DO_FIX) { out[i] = accumulator; }
+    }
+    return accumulator;
+}
+
+template <typename Op, uint32_t VEC_SIZE, bool DO_FIX>
+__device__ typename Op::Data warp_scan(
+    size_t n, typename Op::Data const *x, typename Op::Data *out, // Work dimensions
+    typename Op::Data seed // Seed for thread 0
+) {
+    using Data = typename Op::Data;
+
+    // Divide x across the threads
+    const uint32_t thread_idx = threadIdx.x % 32;
+    const uint32_t n_per_thread = ((n / VEC_SIZE) / 32) * VEC_SIZE; // Aligns to vector size
+    const uint32_t start_i = thread_idx * n_per_thread;
+    const uint32_t end_i = start_i + n_per_thread;
+
+    // Local scan
+    Data accumulator = (thread_idx == 0) ? seed : Op::identity();
+    accumulator = thread_local_scan<Op, VEC_SIZE, false>(n, x, out, start_i, end_i, accumulator);
+    __syncwarp();
+
+    // Hierarchical scan on endpoints
+    accumulator = warp_local_scan<Op>(accumulator);
+
+    if constexpr (DO_FIX) {
+        // Shuffle accumulators
+        accumulator = shfl_up_any(accumulator, 1);
+        accumulator = (thread_idx >= 1) ? accumulator : seed;
+
+        // Local scan fix
+        accumulator = thread_local_scan<Op, VEC_SIZE, true>(n, x, out, start_i, end_i, accumulator);
+
+        // Handle warp tail
+        if (thread_idx == 31) {
+            for (uint32_t i = end_i; i < end_i + (n - 32 * n_per_thread); ++i) {
+                accumulator = Op::combine(accumulator, x[i]);
+                out[i] = accumulator;
+            }
+        }
+    } else {
+        // Handle warp tail
+        if (thread_idx == 31) {
+            for (uint32_t i = end_i; i < end_i + (n - 32 * n_per_thread); ++i) {
+                accumulator = Op::combine(accumulator, x[i]);
+            }
+        }
+    }
+    return accumulator;
+}
+
+template <typename Op, uint32_t VEC_SIZE, bool DO_FIX>
+__device__ void warp_scan_handler(
+    size_t n, typename Op::Data const *x, typename Op::Data *out, // Work dimensions
+    typename Op::Data seed // Seed for thread 0
+) {
+    using Data = typename Op::Data;
+
+    // Divide x into blocks of 32 * VEC_SIZE and pass to warp scan
+    const uint32_t block_size = 32 * VEC_SIZE;
+    const uint32_t num_blocks = max((uint32_t)n / block_size, 1u);
+    const uint32_t thread_idx = threadIdx.x % 32;
+
+    for (uint32_t idx = 0; idx < num_blocks; ++idx) {
+        // Move buffers
+        Data const *bx = x + idx * block_size;
+        Data *bout = out + idx * block_size;
+
+        // On the last block process whatever is left
+        const uint32_t current_block_size = (idx == num_blocks - 1) ? n - idx * block_size : block_size;
+
+        // Call warp scan
+        seed = warp_scan<Op, VEC_SIZE, DO_FIX>(current_block_size, bx, bout, seed);
+        __syncwarp();
+
+        // For the next block, use the seed from the last thread of this block
+        seed = shfl_down_any(seed, 31 - threadIdx.x);
+    }
+
+    if constexpr (!DO_FIX) {
+        // Only output last accumulator to memory
+        if (thread_idx == 31) {
+            *out = seed;
+        }
+    }
+}
+
+// 3-Kernel Parallel Algorithm
+template <typename Op, uint32_t VEC_SIZE, bool DO_FIX>
+__global__ void local_scan(size_t n, typename Op::Data const *x, typename Op::Data *out, typename Op::Data *seed) {
+    using Data = typename Op::Data;
+    // Thread block info
+    const uint32_t num_sm = gridDim.x;
+    const uint32_t num_warp = blockDim.x / 32;
+    const uint32_t block_idx = blockIdx.x;
+    const uint32_t warp_idx = threadIdx.x / 32;
+
+    // Divide x across the SMs
+    uint32_t n_per_sm = ((n / VEC_SIZE) / num_sm) * VEC_SIZE; // Aligns to vector size
+    Data const *sm_x = x + block_idx * n_per_sm;
+    Data *sm_out = out + block_idx * n_per_sm;
+    Data *sm_seed = seed + block_idx * num_warp;
+
+    // Handle SM tail
+    n_per_sm += (block_idx == num_sm - 1) ? n - num_sm * n_per_sm : 0;
+
+    // Divide sm_x across the warps
+    uint32_t n_per_warp = ((n_per_sm / VEC_SIZE) / num_warp) * VEC_SIZE;
+    Data const *warp_x = sm_x + warp_idx * n_per_warp;
+    Data *warp_out = sm_out + warp_idx * n_per_warp;
+    Data *warp_seed = sm_seed + warp_idx;
+
+    // Handle warp tail
+    n_per_warp += (warp_idx == num_warp - 1) ? n_per_sm - num_warp * n_per_warp : 0;
+
+    // Call warp scan
+    if constexpr (DO_FIX) {
+        // Each chunk gets the previous seed
+        Data seed_val = (block_idx == 0 && warp_idx == 0) ? Op::identity() : *(warp_seed - 1);
+        warp_scan_handler<Op, VEC_SIZE, true>(n_per_warp, warp_x, warp_out, seed_val);
+    } else {
+        warp_scan_handler<Op, VEC_SIZE, false>(n_per_warp, warp_x, warp_seed, Op::identity());
+    }
+}
+template <typename Op, uint32_t VEC_SIZE>
+__global__ void hierarchical_scan(size_t n, typename Op::Data const *x, typename Op::Data *out) {
+    warp_scan<Op, VEC_SIZE, true>(n, x, out, Op::identity());
+}
+
+template <typename Op>
+typename Op::Data *launch_scan(
+    size_t n,
+    typename Op::Data *x, // pointer to GPU memory
+    void *workspace       // pointer to GPU memory
+) {
+    using Data = typename Op::Data;
+
+    // Use the workspace as scratch for seeds
+    Data *seed = reinterpret_cast<Data*>(workspace);
+
+    // Thread block dimensions
+    constexpr uint32_t B = 48;
+    constexpr uint32_t W = 32; // Tuning parameter
+    constexpr uint32_t T = 32;
+
+    // Set vector size
+    if constexpr (sizeof(Data) > 16) {
+        return nullptr;
+    }
+    constexpr uint32_t VS = 16 / sizeof(Data);
+
+    // Memory
+    local_scan<Op, VS, false><<<B, W*T>>>(n, x, x, seed);
+    hierarchical_scan<Op, VS><<<1, T>>>(B*W, seed, seed); // Use only 1 SM and 1 warp for the small hierarchical scan
+    local_scan<Op, VS, true><<<B, W*T>>>(n, x, x, seed);
+
+    return x;
+}
+
+} // namespace scan_gpu
+
+////////////////////////////////////////////////////////////////////////////////
 // Optimized GPU Implementation
 
 // Generic helpers and data structures
@@ -239,6 +510,62 @@ __device__ void load_circles_async(
 }
 
 namespace circles_gpu {
+
+// Scan code
+template <typename Op>
+__global__ void create_flag_array(GmemCircles gmem_circles,
+    const uint32_t start_i, const uint32_t start_j, const uint32_t end_i, const uint32_t end_j,
+    typename Op::Data *flag_arr
+) {
+    for (uint32_t c = blockIdx.x * blockDim.x + threadIdx.x; c < gmem_circles.n_circle; c += gridDim.x * blockDim.x) {
+        // Scalar load circle
+        const float c_x = gmem_circles.circle_x[c];
+        const float c_y = gmem_circles.circle_y[c];
+        const float c_radius = gmem_circles.circle_radius[c];
+
+        // Get intersection of circle and tile pixels
+        const int32_t start_inter_i = max(int32_t(c_y - c_radius), (int32_t)start_i);
+        const int32_t end_inter_i = min(int32_t(c_y + c_radius + 1.0f), (int32_t)end_i - 1);
+        const int32_t start_inter_j = max(int32_t(c_x - c_radius), (int32_t)start_j);
+        const int32_t end_inter_j = min(int32_t(c_x + c_radius + 1.0f), (int32_t)end_j - 1);
+
+        // TODO: Handle that circle can cover partial pixels
+
+        // Set flag
+        flag_arr[c] = (start_inter_i <= end_inter_i && start_inter_j <= end_inter_j);
+    }
+}
+
+template <typename Op>
+__global__ void extract_scan(GmemCircles gmem_circles, typename Op::Data *flag_arr, SmemCircles sm_gmem_circles) {
+    using Data = typename Op::Data;
+    if (blockIdx.x == 0 && threadIdx.x == 0) {
+        if (flag_arr[0] == 1) {
+            // Transfer circle from grid array to sm array
+            sm_gmem_circles.circle_x[0] = gmem_circles.circle_x[0];
+            sm_gmem_circles.circle_y[0] = gmem_circles.circle_y[0];
+            sm_gmem_circles.circle_radius[0] = gmem_circles.circle_radius[0];
+            sm_gmem_circles.circle_red[0] = gmem_circles.circle_red[0];
+            sm_gmem_circles.circle_green[0] = gmem_circles.circle_green[0];
+            sm_gmem_circles.circle_blue[0] = gmem_circles.circle_blue[0];
+            sm_gmem_circles.circle_alpha[0] = gmem_circles.circle_alpha[0];
+        }
+    }
+    for (uint32_t c = blockIdx.x * blockDim.x + threadIdx.x + 1; c < gmem_circles.n_circle; c += gridDim.x * blockDim.x) {
+        const Data prev = flag_arr[c - 1];
+        const Data curr = flag_arr[c];
+        if (prev != curr) { // Start of "run", of which the first is a circle in the tile
+            // Transfer circle from grid array to sm array
+            sm_gmem_circles.circle_x[curr - 1] = gmem_circles.circle_x[c];
+            sm_gmem_circles.circle_y[curr - 1] = gmem_circles.circle_y[c];
+            sm_gmem_circles.circle_radius[curr - 1] = gmem_circles.circle_radius[c];
+            sm_gmem_circles.circle_red[curr - 1] = gmem_circles.circle_red[c];
+            sm_gmem_circles.circle_green[curr - 1] = gmem_circles.circle_green[c];
+            sm_gmem_circles.circle_blue[curr - 1] = gmem_circles.circle_blue[c];
+            sm_gmem_circles.circle_alpha[curr - 1] = gmem_circles.circle_alpha[c];
+        }
+    }
+}
 
 template <uint32_t T_TH, uint32_t T_TW>
 __device__ void thread_level_render_helper(
@@ -522,11 +849,73 @@ template <uint32_t SM_TH, uint32_t SM_TW, uint32_t T_TH, uint32_t T_TW, uint32_t
 void launch_specialized_kernel(
     const uint32_t width, const uint32_t height,
     GmemCircles gmem_circles,
-    float *img_red, float *img_green, float *img_blue
+    float *img_red, float *img_green, float *img_blue,
+    GpuMemoryPool &memory_pool
 ) {
     // For each tile run a scan using the full grid to get the circles actually in the tile
-    // const uint32_t smt_per_i = height / SM_TH;
-    // const uint32_t smt_per_j = width / SM_TW;
+    const uint32_t smt_per_i = height / SM_TH;
+    const uint32_t smt_per_j = width / SM_TW;
+    const uint32_t num_tiles = smt_per_i * smt_per_j;
+
+    // Extra gmem sizes
+    using Data = typename SumOp::Data;
+    const size_t scan_size = 48 * 32 * sizeof(Data);
+    const size_t flag_arr_size = gmem_circles.n_circle * sizeof(Data);
+    const uint32_t num_circles = gmem_circles.n_circle; // The max number of circles per tile -> tune
+    const size_t extract_data_size = num_tiles * (7 * sizeof(float)) * num_circles; // tiles x circles x 7 float arrays
+    const size_t sm_gmem_circles_size = num_tiles * sizeof(SmemCircles);
+
+    // Setup extra gmem
+    void *seed = reinterpret_cast<void*>(memory_pool.alloc(scan_size));
+    Data *flag = reinterpret_cast<Data*>(memory_pool.alloc(flag_arr_size));
+    float *sm_gmem_circles_workspaces = reinterpret_cast<float*>(memory_pool.alloc(extract_data_size));
+    SmemCircles *sm_gmem_circles_arr = reinterpret_cast<SmemCircles*>(memory_pool.alloc(sm_gmem_circles_size));
+
+    // Iterate over SM tiles
+    for (uint32_t sm_idx = 0; sm_idx < num_tiles; ++sm_idx) {
+        // Setup sm_gmem_circles
+        const uint32_t tile_offset = sm_idx * (7 * num_circles);
+        float *sm_gmem_circles_workspace = sm_gmem_circles_workspaces + tile_offset;
+        SmemCircles sm_gmem_circles = {0,
+            sm_gmem_circles_workspace + 0 * num_circles,
+            sm_gmem_circles_workspace + 1 * num_circles,
+            sm_gmem_circles_workspace + 2 * num_circles,
+            sm_gmem_circles_workspace + 3 * num_circles,
+            sm_gmem_circles_workspace + 4 * num_circles,
+            sm_gmem_circles_workspace + 5 * num_circles,
+            sm_gmem_circles_workspace + 6 * num_circles,
+        }; // Set n_circle after scan
+
+        // SM tile indices
+        const uint32_t smt_i = sm_idx / smt_per_j;
+        const uint32_t smt_j = sm_idx % smt_per_j;
+
+        // Get tile bounds
+        const uint32_t start_i = smt_i * SM_TH;
+        const uint32_t start_j = smt_j * SM_TW;
+        const uint32_t end_i = start_i + SM_TH;
+        const uint32_t end_j = start_j + SM_TW;
+
+        // Create flag array
+        create_flag_array<SumOp><<<48, 32*32>>>(gmem_circles,
+            start_i, start_j, end_i, end_j,
+            flag
+        );
+
+        // Run scan on flag array
+        scan_gpu::launch_scan<SumOp>(gmem_circles.n_circle, flag, seed);
+
+        // Extract scan
+        extract_scan<SumOp><<<48, 32*32>>>(gmem_circles, flag, sm_gmem_circles);
+
+        // Set n_circle
+        Data last_run;
+        CUDA_CHECK(cudaMemcpy(&last_run, &flag[gmem_circles.n_circle - 1], sizeof(Data), cudaMemcpyDeviceToHost));
+        sm_gmem_circles.n_circle = last_run;
+
+        // Store sm_gmem_circles in gpu memory
+        CUDA_CHECK(cudaMemcpy(&sm_gmem_circles_arr[sm_idx], &sm_gmem_circles, sizeof(SmemCircles), cudaMemcpyHostToDevice));
+    }
 
     // Launch render kernel
     constexpr int smem_size_bytes = NC * 7 * sizeof(float); // 7 float arrays
@@ -560,10 +949,10 @@ void launch_render(
     GmemCircles gmem_circles = {(uint32_t)n_circle, circle_x, circle_y, circle_radius, circle_red, circle_green, circle_blue, circle_alpha};
     if (height == 256 && width == 256) {
         constexpr uint32_t num_circles = 80; // at most 80 in the small test cases
-        launch_specialized_kernel<32, 32, 2, 2, num_circles>(width, height, gmem_circles, img_red, img_green, img_blue);
+        launch_specialized_kernel<32, 32, 2, 2, num_circles>(width, height, gmem_circles, img_red, img_green, img_blue, memory_pool);
     } else if (height == 1024 && width == 1024) {
         constexpr uint32_t num_circles = 2000; // Tuning parameter
-        launch_specialized_kernel<128, 128, 8, 8, num_circles>(width, height, gmem_circles, img_red, img_green, img_blue);
+        launch_specialized_kernel<128, 128, 8, 8, num_circles>(width, height, gmem_circles, img_red, img_green, img_blue, memory_pool);
     } else {
         // Not handled
         return;
