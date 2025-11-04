@@ -1338,120 +1338,69 @@ void launch_specialized_kernel(
     for (uint32_t idx = 0; idx < num_tiles / 3; ++idx) {
         const uint32_t sm_idx = idx * 3;
 
-        // Setup sm_gmem_circles
-        float *sm_gmem_circles_workspace1 = sm_gmem_circles_workspaces + sm_idx * (7 * num_circles_aligned);
-        SmemCircles sm_gmem_circles1 = {0, // Set n_circle after scan
-            sm_gmem_circles_workspace1 + 0 * num_circles_aligned,
-            sm_gmem_circles_workspace1 + 1 * num_circles_aligned,
-            sm_gmem_circles_workspace1 + 2 * num_circles_aligned,
-            sm_gmem_circles_workspace1 + 3 * num_circles_aligned,
-            sm_gmem_circles_workspace1 + 4 * num_circles_aligned,
-            sm_gmem_circles_workspace1 + 5 * num_circles_aligned,
-            sm_gmem_circles_workspace1 + 6 * num_circles_aligned
-        };
-        float *sm_gmem_circles_workspace2 = sm_gmem_circles_workspaces + (sm_idx + 1) * (7 * num_circles_aligned);
-        SmemCircles sm_gmem_circles2 = {0,
-            sm_gmem_circles_workspace2 + 0 * num_circles_aligned,
-            sm_gmem_circles_workspace2 + 1 * num_circles_aligned,
-            sm_gmem_circles_workspace2 + 2 * num_circles_aligned,
-            sm_gmem_circles_workspace2 + 3 * num_circles_aligned,
-            sm_gmem_circles_workspace2 + 4 * num_circles_aligned,
-            sm_gmem_circles_workspace2 + 5 * num_circles_aligned,
-            sm_gmem_circles_workspace2 + 6 * num_circles_aligned
-        };
-        float *sm_gmem_circles_workspace3 = sm_gmem_circles_workspaces + (sm_idx + 2) * (7 * num_circles_aligned);
-        SmemCircles sm_gmem_circles3 = {0,
-            sm_gmem_circles_workspace3 + 0 * num_circles_aligned,
-            sm_gmem_circles_workspace3 + 1 * num_circles_aligned,
-            sm_gmem_circles_workspace3 + 2 * num_circles_aligned,
-            sm_gmem_circles_workspace3 + 3 * num_circles_aligned,
-            sm_gmem_circles_workspace3 + 4 * num_circles_aligned,
-            sm_gmem_circles_workspace3 + 5 * num_circles_aligned,
-            sm_gmem_circles_workspace3 + 6 * num_circles_aligned
-        };
+        // Setup
+        SmGmemCirclesArray3 sm_gmem_circles_array;
+        TileBoundsArray3 tile_bounds;
+        for (uint32_t k = 0; k < 3; ++k) {
+            // Setup sm_gmem_circles
+            float *sm_gmem_circles_workspace_k = sm_gmem_circles_workspaces + (sm_idx + k) * (7 * num_circles_aligned);
+            SmemCircles sm_gmem_circles_k = {0, // Set n_circle after scan
+                sm_gmem_circles_workspace_k + 0 * num_circles_aligned,
+                sm_gmem_circles_workspace_k + 1 * num_circles_aligned,
+                sm_gmem_circles_workspace_k + 2 * num_circles_aligned,
+                sm_gmem_circles_workspace_k + 3 * num_circles_aligned,
+                sm_gmem_circles_workspace_k + 4 * num_circles_aligned,
+                sm_gmem_circles_workspace_k + 5 * num_circles_aligned,
+                sm_gmem_circles_workspace_k + 6 * num_circles_aligned
+            };
+            sm_gmem_circles_array.circles[k] = sm_gmem_circles_k;
 
-        // SM tile indices
-        const uint32_t smt1_i = sm_idx / smt_per_j;
-        const uint32_t smt1_j = sm_idx % smt_per_j;
-        const uint32_t smt2_i = (sm_idx + 1) / smt_per_j;
-        const uint32_t smt2_j = (sm_idx + 1) % smt_per_j;
-        const uint32_t smt3_i = (sm_idx + 2) / smt_per_j;
-        const uint32_t smt3_j = (sm_idx + 2) % smt_per_j;
+            // SM tile indices
+            const uint32_t smt_i = (sm_idx + k) / smt_per_j;
+            const uint32_t smt_j = (sm_idx + k) % smt_per_j;
 
-        // Get tile bounds
-        const uint32_t start1_i = smt1_i * SM_TH;
-        const uint32_t start1_j = smt1_j * SM_TW;
-        const uint32_t end1_i = start1_i + SM_TH;
-        const uint32_t end1_j = start1_j + SM_TW;
-        const uint32_t start2_i = smt2_i * SM_TH;
-        const uint32_t start2_j = smt2_j * SM_TW;
-        const uint32_t end2_i = start2_i + SM_TH;
-        const uint32_t end2_j = start2_j + SM_TW;
-        const uint32_t start3_i = smt3_i * SM_TH;
-        const uint32_t start3_j = smt3_j * SM_TW;
-        const uint32_t end3_i = start3_i + SM_TH;
-        const uint32_t end3_j = start3_j + SM_TW;
+            // Get tile bounds
+            const uint32_t start_i = smt_i * SM_TH;
+            const uint32_t start_j = smt_j * SM_TW;
+            const uint32_t end_i = start_i + SM_TH;
+            const uint32_t end_j = start_j + SM_TW;
+
+            // Setup tile bounds
+            tile_bounds.tiles[k] = {(float)start_j, (float)start_i, float(end_j-1), float(end_i-1)};
+        }
 
         // Create flag array
-        TileBoundsArray3 tile_bounds = {{
-            {(float)start1_j, (float)start1_i, float(end1_j-1), float(end1_i-1)},
-            {(float)start2_j, (float)start2_i, float(end2_j-1), float(end2_i-1)},
-            {(float)start3_j, (float)start3_i, float(end3_j-1), float(end3_i-1)}
-        }};
         create_flag_array<CircleOp3Tile, 3, 2, TileBoundsArray3><<<48, 32*32>>>(gmem_circles, tile_bounds, flag);
 
         // Run scan on flag array
         scan_gpu::launch_scan<CircleOp3Tile>(gmem_circles.n_circle, flag, seed);
 
         // Extract scan
-        SmGmemCirclesArray3 sm_gmem_circles_array = {{
-            sm_gmem_circles1, sm_gmem_circles2, sm_gmem_circles3
-        }};
         extract_scan<CircleOp3Tile, 3, 2, SmGmemCirclesArray3><<<48, 32*32>>>(gmem_circles, flag, sm_gmem_circles_array);
-
-        // Set n_circle
         Data last_run;
         CUDA_CHECK(cudaMemcpy(&last_run, &flag[gmem_circles.n_circle - 1], sizeof(Data), cudaMemcpyDeviceToHost));
-        sm_gmem_circles1.n_circle = last_run.get_v1();
-        sm_gmem_circles2.n_circle = last_run.get_v2();
-        sm_gmem_circles3.n_circle = last_run.get_v3();
 
-        // Convert to GmemCircles
-        GmemCircles const_sm_gmem_circles1 = {
-            sm_gmem_circles1.n_circle,
-            sm_gmem_circles1.circle_x,
-            sm_gmem_circles1.circle_y,
-            sm_gmem_circles1.circle_radius,
-            sm_gmem_circles1.circle_red,
-            sm_gmem_circles1.circle_green,
-            sm_gmem_circles1.circle_blue,
-            sm_gmem_circles1.circle_alpha
-        };
-        GmemCircles const_sm_gmem_circles2 = {
-            sm_gmem_circles2.n_circle,
-            sm_gmem_circles2.circle_x,
-            sm_gmem_circles2.circle_y,
-            sm_gmem_circles2.circle_radius,
-            sm_gmem_circles2.circle_red,
-            sm_gmem_circles2.circle_green,
-            sm_gmem_circles2.circle_blue,
-            sm_gmem_circles2.circle_alpha
-        };
-        GmemCircles const_sm_gmem_circles3 = {
-            sm_gmem_circles3.n_circle,
-            sm_gmem_circles3.circle_x,
-            sm_gmem_circles3.circle_y,
-            sm_gmem_circles3.circle_radius,
-            sm_gmem_circles3.circle_red,
-            sm_gmem_circles3.circle_green,
-            sm_gmem_circles3.circle_blue,
-            sm_gmem_circles3.circle_alpha
-        };
+        // Copy from host to device
+        for (uint32_t k = 0; k < 3; ++k) {
+            // Set n_circle
+            SmemCircles sm_gmem_circles = sm_gmem_circles_array.circles[k];
+            sm_gmem_circles.n_circle = last_run.get_vi(k);
 
-        // Store sm_gmem_circles in gpu memory
-        CUDA_CHECK(cudaMemcpy(&sm_gmem_circles_arr[sm_idx], &const_sm_gmem_circles1, sizeof(GmemCircles), cudaMemcpyHostToDevice));
-        CUDA_CHECK(cudaMemcpy(&sm_gmem_circles_arr[sm_idx + 1], &const_sm_gmem_circles2, sizeof(GmemCircles), cudaMemcpyHostToDevice));
-        CUDA_CHECK(cudaMemcpy(&sm_gmem_circles_arr[sm_idx + 2], &const_sm_gmem_circles3, sizeof(GmemCircles), cudaMemcpyHostToDevice));
+            // Convert to GmemCircles
+            GmemCircles const_sm_gmem_circles_k = {
+                sm_gmem_circles.n_circle,
+                sm_gmem_circles.circle_x,
+                sm_gmem_circles.circle_y,
+                sm_gmem_circles.circle_radius,
+                sm_gmem_circles.circle_red,
+                sm_gmem_circles.circle_green,
+                sm_gmem_circles.circle_blue,
+                sm_gmem_circles.circle_alpha
+            };
+
+            // Store sm_gmem_circles in gpu memory
+            CUDA_CHECK(cudaMemcpy(&sm_gmem_circles_arr[sm_idx + k], &const_sm_gmem_circles_k, sizeof(GmemCircles), cudaMemcpyHostToDevice));
+        }
     }
     // Handle tail
     using Data1Tile = typename CircleOp1Tile::Data;
