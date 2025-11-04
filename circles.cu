@@ -740,7 +740,7 @@ __global__ void create_flag_array(GmemCircles gmem_circles,
 ) {
     // If size is less than vector size use scalar version
     if (gmem_circles.n_circle < 16) {
-        scalar_create_flag_array<Op, N, VS>(gmem_circles, tile_bounds, flag_arr);
+        scalar_create_flag_array<Op, N, VS, TileBoundsT>(gmem_circles, tile_bounds, flag_arr);
         return;
     }
 
