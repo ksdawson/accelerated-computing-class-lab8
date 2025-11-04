@@ -375,6 +375,81 @@ typename Op::Data *launch_scan(
 ////////////////////////////////////////////////////////////////////////////////
 // Optimized GPU Implementation
 
+struct __align__(16) CircleData7Tile {
+    uint64_t lo; // lower 64 bits
+    uint64_t hi; // upper 64 bits
+
+    static constexpr uint32_t BITS = 18;
+    static constexpr uint64_t MASK = (1ULL << BITS) - 1;
+
+    // Use this bit hack: https://graphics.stanford.edu/~seander/bithacks.html#MaskedMerge
+    __host__ __device__ __forceinline__ void set_vi(uint32_t i, uint32_t v) {
+        v &= MASK; // mask to 18 bits
+        if (i < 3) {
+            uint64_t a = lo;
+            uint64_t b = uint64_t(v) << (i * BITS);
+            uint64_t mask = MASK << (i * BITS);
+            lo = a ^ ((a ^ b) & mask);
+        } else if (i == 3) {
+            // use 64 - 18*3 = 10 bits from lo
+            uint64_t a_lo = lo;
+            uint64_t b_lo = uint64_t(v) << 54;
+            uint64_t mask_lo = MASK << 54;
+            lo = a_lo ^ ((a_lo ^ b_lo) & mask_lo);
+
+            // use 18 - 10 = 8 bits from hi
+            uint64_t a_hi = hi;
+            uint64_t b_hi = uint64_t(v) >> 10;
+            uint64_t mask_hi = MASK >> 10;
+            hi = a_hi ^ ((a_hi ^ b_hi) & mask_hi);
+        } else { // i = 4,5,6
+            uint64_t a = hi;
+            uint64_t b = uint64_t(v) << (i * BITS - 64);
+            uint64_t mask = MASK << (i * BITS - 64);
+            hi = a ^ ((a ^ b) & mask);
+        }
+    }
+
+    __host__ __device__ __forceinline__ uint32_t get_vi(uint32_t i) const {
+        if (i < 3) {
+            return uint32_t((lo >> (i * BITS)) & MASK);
+        } else if (i == 3) {
+            // use 10 bits from lo
+            uint32_t lo_part = uint32_t(lo >> 54);
+
+            // use 8 bits from hi
+            uint32_t hi_part = uint32_t(hi & (MASK >> 10));
+
+            // combine them
+            return (hi_part << 10) | lo_part;
+        } else { // i = 4,5,6
+            return uint32_t((hi >> (i * BITS - 64)) & MASK);
+        }
+    }
+};
+static_assert(sizeof(CircleData7Tile) == 16, "CircleData7Tile must be 16 bytes");
+struct CircleOp7Tile {
+    using Data = CircleData7Tile;
+
+    static __host__ __device__ __forceinline__ Data identity() {
+        CircleData7Tile result;
+        result.lo = 0;
+        result.hi = 0;
+        return result;
+    }
+
+    static __host__ __device__ __forceinline__ Data combine(Data a, Data b) {
+        CircleData7Tile result;
+        result.lo = 0;
+        result.hi = 0;
+        #pragma unroll
+        for (uint32_t k = 0; k < 7; ++k) {
+            result.set_vi(k, a.get_vi(k) + b.get_vi(k));
+        }
+        return result;
+    }
+};
+
 struct __align__(8) CircleData3Tile {
     uint64_t data;
 
@@ -441,6 +516,7 @@ struct CircleOp3Tile {
         return result;
     }
 };
+
 struct __align__(4) CircleData1Tile {
     uint32_t data;
     __host__ __device__ __forceinline__ void set_vi(uint32_t i, uint32_t v) {
@@ -500,11 +576,17 @@ struct TileBoundsArray1 {
 struct TileBoundsArray3 {
     TileBounds tiles[3];
 };
+struct TileBoundsArray7 {
+    TileBounds tiles[7];
+};
 struct SmGmemCirclesArray1 {
     SmemCircles circles[1];
 };
 struct SmGmemCirclesArray3 {
     SmemCircles circles[3];
+};
+struct SmGmemCirclesArray7 {
+    SmemCircles circles[7];
 };
 
 __device__ void load_circles(
@@ -1156,13 +1238,20 @@ void launch_specialized_kernel(
     float *img_red, float *img_green, float *img_blue,
     GpuMemoryPool &memory_pool
 ) {
+    // Tile info
+    using Data = typename CircleOp7Tile::Data;
+    using SmGmemCirclesArray = SmGmemCirclesArray7;
+    using TileBoundsArray = TileBoundsArray7;
+    using CircleOp = CircleOp7Tile;
+    constexpr uint32_t N = 7;
+    constexpr uint32_t VS = 16 / sizeof(Data);
+
     // For each tile run a scan using the full grid to get the circles actually in the tile (takes ~75ms)
     const uint32_t smt_per_i = height / SM_TH;
     const uint32_t smt_per_j = width / SM_TW;
     const uint32_t num_tiles = smt_per_i * smt_per_j;
 
     // Extra gmem sizes
-    using Data = typename CircleOp3Tile::Data;
     const size_t scan_size = 48 * 32 * sizeof(Data);
     const size_t flag_arr_size = gmem_circles.n_circle * sizeof(Data);
     const uint32_t num_circles = gmem_circles.n_circle; // The max number of circles per tile -> tune
@@ -1177,13 +1266,13 @@ void launch_specialized_kernel(
     GmemCircles *sm_gmem_circles_arr = reinterpret_cast<GmemCircles*>(memory_pool.alloc(sm_gmem_circles_size));
 
     // Iterate over SM tiles
-    for (uint32_t idx = 0; idx < num_tiles / 3; ++idx) {
-        const uint32_t sm_idx = idx * 3;
+    for (uint32_t idx = 0; idx < num_tiles / N; ++idx) {
+        const uint32_t sm_idx = idx * N;
 
         // Setup
-        SmGmemCirclesArray3 sm_gmem_circles_array;
-        TileBoundsArray3 tile_bounds;
-        for (uint32_t k = 0; k < 3; ++k) {
+        SmGmemCirclesArray sm_gmem_circles_array;
+        TileBoundsArray tile_bounds;
+        for (uint32_t k = 0; k < N; ++k) {
             // Setup sm_gmem_circles
             float *sm_gmem_circles_workspace_k = sm_gmem_circles_workspaces + (sm_idx + k) * (7 * num_circles_aligned);
             SmemCircles sm_gmem_circles_k = {0, // Set n_circle after scan
@@ -1212,18 +1301,18 @@ void launch_specialized_kernel(
         }
 
         // Create flag array
-        create_flag_array<CircleOp3Tile, 3, 2, TileBoundsArray3><<<48, 32*32>>>(gmem_circles, tile_bounds, flag);
+        create_flag_array<CircleOp7Tile, N, VS, TileBoundsArray7><<<48, 32*32>>>(gmem_circles, tile_bounds, flag);
 
         // Run scan on flag array
-        scan_gpu::launch_scan<CircleOp3Tile>(gmem_circles.n_circle, flag, seed);
+        scan_gpu::launch_scan<CircleOp>(gmem_circles.n_circle, flag, seed);
 
         // Extract scan
-        extract_scan<CircleOp3Tile, 3, 2, SmGmemCirclesArray3><<<48, 32*32>>>(gmem_circles, flag, sm_gmem_circles_array);
+        extract_scan<CircleOp, N, VS, SmGmemCirclesArray><<<48, 32*32>>>(gmem_circles, flag, sm_gmem_circles_array);
         Data last_run;
         CUDA_CHECK(cudaMemcpy(&last_run, &flag[gmem_circles.n_circle - 1], sizeof(Data), cudaMemcpyDeviceToHost));
 
         // Copy from host to device
-        for (uint32_t k = 0; k < 3; ++k) {
+        for (uint32_t k = 0; k < N; ++k) {
             // Set n_circle
             SmemCircles sm_gmem_circles = sm_gmem_circles_array.circles[k];
             sm_gmem_circles.n_circle = last_run.get_vi(k);
@@ -1247,7 +1336,7 @@ void launch_specialized_kernel(
     // Handle tail
     using Data1Tile = typename CircleOp1Tile::Data;
     Data1Tile *flag_1Tile = reinterpret_cast<Data1Tile*>(flag);
-    for (uint32_t sm_idx = (num_tiles / 3) * 3; sm_idx < num_tiles; ++sm_idx) {
+    for (uint32_t sm_idx = (num_tiles / N) * N; sm_idx < num_tiles; ++sm_idx) {
         float *sm_gmem_circles_workspace = sm_gmem_circles_workspaces + sm_idx * (7 * num_circles_aligned);
         SmemCircles sm_gmem_circles = {0,
             sm_gmem_circles_workspace + 0 * num_circles_aligned,
