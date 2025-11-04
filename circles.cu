@@ -375,6 +375,19 @@ typename Op::Data *launch_scan(
 ////////////////////////////////////////////////////////////////////////////////
 // Optimized GPU Implementation
 
+struct TileBounds {
+    float start_jf;
+    float start_if;
+    float end_jf;
+    float end_if;
+};
+struct TileBoundsArray1 {
+    TileBounds tiles[1];
+};
+struct TileBoundsArray3 {
+    TileBounds tiles[3];
+};
+
 struct __align__(8) CircleData3Tile {
     uint64_t data;
 
@@ -382,28 +395,44 @@ struct __align__(8) CircleData3Tile {
     static constexpr uint32_t BITS = 21;
     static constexpr uint64_t MASK = (1ULL << BITS) - 1;
 
+    // Individual setters
     __host__ __device__ __forceinline__ void set_v1(uint32_t v) {
         data = (data & ~(MASK << 0)) | (uint64_t(v & MASK) << 0);
     }
-
     __host__ __device__ __forceinline__ void set_v2(uint32_t v) {
         data = (data & ~(MASK << BITS)) | (uint64_t(v & MASK) << BITS);
     }
-
     __host__ __device__ __forceinline__ void set_v3(uint32_t v) {
         data = (data & ~(MASK << (2 * BITS))) | (uint64_t(v & MASK) << (2 * BITS));
     }
 
+    // Individual getters
     __host__ __device__ __forceinline__ uint32_t get_v1() const {
         return uint32_t((data >> 0) & MASK);
     }
-
     __host__ __device__ __forceinline__ uint32_t get_v2() const {
         return uint32_t((data >> BITS) & MASK);
     }
-
     __host__ __device__ __forceinline__ uint32_t get_v3() const {
         return uint32_t((data >> (2 * BITS)) & MASK);
+    }
+
+    // Generic setter/getter
+    __host__ __device__ __forceinline__ void set_vi(uint32_t i, uint32_t v) {
+        switch (i) {
+            case 0: set_v1(v); break;
+            case 1: set_v2(v); break;
+            case 2: set_v3(v); break;
+            default: break;
+        }
+    }
+    __host__ __device__ __forceinline__ uint32_t get_vi(uint32_t i) {
+        switch (i) {
+            case 0: return get_v1(); break;
+            case 1: return get_v2(); break;
+            case 2: return get_v3(); break;
+            default: return 0; break;
+        }
     }
 };
 static_assert(sizeof(CircleData3Tile) == 8, "CircleData3Tile must be 8 bytes");
@@ -425,6 +454,31 @@ struct CircleOp3Tile {
         return result;
     }
 };
+struct __align__(4) CircleData1Tile {
+    uint32_t data;
+    __host__ __device__ __forceinline__ void set_vi(uint32_t i, uint32_t v) {
+        data = v;
+    }
+    __host__ __device__ __forceinline__ uint32_t get_vi(uint32_t i) {
+        return data;
+    }
+};
+static_assert(sizeof(CircleData1Tile) == 4, "CircleData1Tile must be 4 bytes");
+// struct CircleOp1Tile {
+//     using Data = CircleData1Tile;
+
+//     static __host__ __device__ __forceinline__ Data identity() { 
+//         CircleData1Tile result;
+//         result.data = 0;
+//         return result;
+//     }
+
+//     static __host__ __device__ __forceinline__ Data combine(Data a, Data b) {
+//         CircleData1Tile result;
+//         result.data = a.data + b.data;
+//         return result;
+//     }
+// };
 struct CircleOp1Tile {
     using Data = uint32_t;
 
@@ -574,29 +628,12 @@ __device__ bool circle_intersects_rect(
     return (dx * dx + dy * dy) < (radius * radius);
 }
 
-// Scan code
-template <typename Op>
+/// 3 tile versions
+template <typename Op, uint32_t N, uint32_t VS, typename TileBoundsT>
 __device__ void scalar_create_flag_array(GmemCircles gmem_circles,
-    const uint32_t start1_i, const uint32_t start1_j, const uint32_t end1_i, const uint32_t end1_j,
-    const uint32_t start2_i, const uint32_t start2_j, const uint32_t end2_i, const uint32_t end2_j,
-    const uint32_t start3_i, const uint32_t start3_j, const uint32_t end3_i, const uint32_t end3_j,
-    typename Op::Data *flag_arr
+    TileBoundsT tile_bounds, typename Op::Data *flag_arr
 ) {
     using Data = typename Op::Data;
-    // Hoist tile bounds
-    const float start1_jf = (float)start1_j;
-    const float start1_if = (float)start1_i;
-    const float end1_jf = float(end1_j - 1);
-    const float end1_if = float(end1_i - 1);
-    const float start2_jf = (float)start2_j;
-    const float start2_if = (float)start2_i;
-    const float end2_jf = float(end2_j - 1);
-    const float end2_if = float(end2_i - 1);
-    const float start3_jf = (float)start3_j;
-    const float start3_if = (float)start3_i;
-    const float end3_jf = float(end3_j - 1);
-    const float end3_if = float(end3_i - 1);
-
     for (uint32_t c = blockIdx.x * blockDim.x + threadIdx.x; c < gmem_circles.n_circle; c += gridDim.x * blockDim.x) {
         // Scalar load circle
         const float c_x = gmem_circles.circle_x[c];
@@ -605,23 +642,26 @@ __device__ void scalar_create_flag_array(GmemCircles gmem_circles,
 
         // Set flag
         Data result;
-        result.set_v1(circle_intersects_rect(c_x, c_y, c_radius, start1_jf, start1_if, end1_jf, end1_if));
-        result.set_v2(circle_intersects_rect(c_x, c_y, c_radius, start2_jf, start2_if, end2_jf, end2_if));
-        result.set_v3(circle_intersects_rect(c_x, c_y, c_radius, start3_jf, start3_if, end3_jf, end3_if));
+        #pragma unroll
+        for (uint32_t k = 0; k < N; ++k) {
+            result.set_vi(k,
+                circle_intersects_rect(c_x, c_y, c_radius,
+                    tile_bounds.tiles[k].start_jf, tile_bounds.tiles[k].start_if,
+                    tile_bounds.tiles[k].end_jf, tile_bounds.tiles[k].end_if
+                )
+            );
+        }
         flag_arr[c] = result;
     }
 }
-template <typename Op>
+template <typename Op, uint32_t N, uint32_t VS, typename TileBoundsT>
 __launch_bounds__(32*32)
 __global__ void create_flag_array(GmemCircles gmem_circles,
-    const uint32_t start1_i, const uint32_t start1_j, const uint32_t end1_i, const uint32_t end1_j,
-    const uint32_t start2_i, const uint32_t start2_j, const uint32_t end2_i, const uint32_t end2_j,
-    const uint32_t start3_i, const uint32_t start3_j, const uint32_t end3_i, const uint32_t end3_j,
-    typename Op::Data *flag_arr
+    TileBoundsT tile_bounds, typename Op::Data *flag_arr
 ) {
     // If size is less than vector size use scalar version
     if (gmem_circles.n_circle < 16) {
-        scalar_create_flag_array<Op>(gmem_circles, start1_i, start1_j, end1_i, end1_j, start2_i, start2_j, end2_i, end2_j, start3_i, start3_j, end3_i, end3_j, flag_arr);
+        scalar_create_flag_array<Op, N, VS>(gmem_circles, tile_bounds, flag_arr);
         return;
     }
 
@@ -632,22 +672,8 @@ __global__ void create_flag_array(GmemCircles gmem_circles,
 
     // Vectorize flag array
     using Data = typename Op::Data;
-    using VecData = Vectorized<Data, 2>;
-    VecData *flag_arr2 = reinterpret_cast<VecData*>(flag_arr);
-
-    // Hoist tile bounds
-    const float start1_jf = (float)start1_j;
-    const float start1_if = (float)start1_i;
-    const float end1_jf = float(end1_j - 1);
-    const float end1_if = float(end1_i - 1);
-    const float start2_jf = (float)start2_j;
-    const float start2_if = (float)start2_i;
-    const float end2_jf = float(end2_j - 1);
-    const float end2_if = float(end2_i - 1);
-    const float start3_jf = (float)start3_j;
-    const float start3_if = (float)start3_i;
-    const float end3_jf = float(end3_j - 1);
-    const float end3_if = float(end3_i - 1);
+    using VecData = Vectorized<Data, VS>;
+    VecData *vec_flag_arr = reinterpret_cast<VecData*>(flag_arr);
 
     // Handle vectors
     for (uint32_t vc = blockIdx.x * blockDim.x + threadIdx.x; vc < gmem_circles.n_circle / 4; vc += gridDim.x * blockDim.x) {
@@ -656,31 +682,32 @@ __global__ void create_flag_array(GmemCircles gmem_circles,
         const float4 c_y4 = gmem_circle_y4[vc];
         const float4 c_radius4 = gmem_circle_radius4[vc];
 
+        // Extract 4 floats into an array for easier indexing
+        float c_x[4] = {c_x4.x, c_x4.y, c_x4.z, c_x4.w};
+        float c_y[4] = {c_y4.x, c_y4.y, c_y4.z, c_y4.w};
+        float c_radius[4] = {c_radius4.x, c_radius4.y, c_radius4.z, c_radius4.w};
+
         // Set flags
-        VecData result1;
-        Data rx1;
-        Data ry1;
-        rx1.set_v1(circle_intersects_rect(c_x4.x, c_y4.x, c_radius4.x, start1_jf, start1_if, end1_jf, end1_if));
-        rx1.set_v2(circle_intersects_rect(c_x4.x, c_y4.x, c_radius4.x, start2_jf, start2_if, end2_jf, end2_if));
-        rx1.set_v3(circle_intersects_rect(c_x4.x, c_y4.x, c_radius4.x, start3_jf, start3_if, end3_jf, end3_if));
-        ry1.set_v1(circle_intersects_rect(c_x4.y, c_y4.y, c_radius4.y, start1_jf, start1_if, end1_jf, end1_if));
-        ry1.set_v2(circle_intersects_rect(c_x4.y, c_y4.y, c_radius4.y, start2_jf, start2_if, end2_jf, end2_if));
-        ry1.set_v3(circle_intersects_rect(c_x4.y, c_y4.y, c_radius4.y, start3_jf, start3_if, end3_jf, end3_if));
-        result1.elements[0] = rx1;
-        result1.elements[1] = ry1;
-        flag_arr2[vc * 2] = result1;
-        VecData result2;
-        Data rx2;
-        Data ry2;
-        rx2.set_v1(circle_intersects_rect(c_x4.z, c_y4.z, c_radius4.z, start1_jf, start1_if, end1_jf, end1_if));
-        rx2.set_v2(circle_intersects_rect(c_x4.z, c_y4.z, c_radius4.z, start2_jf, start2_if, end2_jf, end2_if));
-        rx2.set_v3(circle_intersects_rect(c_x4.z, c_y4.z, c_radius4.z, start3_jf, start3_if, end3_jf, end3_if));
-        ry2.set_v1(circle_intersects_rect(c_x4.w, c_y4.w, c_radius4.w, start1_jf, start1_if, end1_jf, end1_if));
-        ry2.set_v2(circle_intersects_rect(c_x4.w, c_y4.w, c_radius4.w, start2_jf, start2_if, end2_jf, end2_if));
-        ry2.set_v3(circle_intersects_rect(c_x4.w, c_y4.w, c_radius4.w, start3_jf, start3_if, end3_jf, end3_if));
-        result2.elements[0] = rx2;
-        result2.elements[1] = ry2;
-        flag_arr2[vc * 2 + 1] = result2;
+        #pragma unroll
+        for (uint32_t i = 0; i < 4 / VS; ++i) {
+            VecData result;
+            #pragma unroll
+            for (uint32_t j = 0; j < VS; ++j) {
+                const uint32_t idx = i * VS + j;
+                Data r;
+                #pragma unroll
+                for (uint32_t k = 0; k < N; ++k) {
+                    r.set_vi(k,
+                        circle_intersects_rect(c_x[idx], c_y[idx], c_radius[idx],
+                            tile_bounds.tiles[k].start_jf, tile_bounds.tiles[k].start_if,
+                            tile_bounds.tiles[k].end_jf, tile_bounds.tiles[k].end_if
+                        )
+                    );
+                }
+                result.elements[j] = r;
+            }
+            vec_flag_arr[vc * (4 / VS) + i] = result;
+        }
     }
 
     // Handle tail
@@ -692,9 +719,15 @@ __global__ void create_flag_array(GmemCircles gmem_circles,
 
         // Set flag
         Data result;
-        result.set_v1(circle_intersects_rect(c_x, c_y, c_radius, start1_jf, start1_if, end1_jf, end1_if));
-        result.set_v2(circle_intersects_rect(c_x, c_y, c_radius, start2_jf, start2_if, end2_jf, end2_if));
-        result.set_v3(circle_intersects_rect(c_x, c_y, c_radius, start3_jf, start3_if, end3_jf, end3_if));
+        #pragma unroll
+        for (uint32_t k = 0; k < N; ++k) {
+            result.set_vi(k,
+                circle_intersects_rect(c_x, c_y, c_radius,
+                    tile_bounds.tiles[k].start_jf, tile_bounds.tiles[k].start_if,
+                    tile_bounds.tiles[k].end_jf, tile_bounds.tiles[k].end_if
+                )
+            );
+        }
         flag_arr[c] = result;
     }
 }
@@ -823,6 +856,7 @@ __global__ void extract_scan(GmemCircles gmem_circles, typename Op::Data *flag_a
         extract_scan_helper<Op>(gmem_circles, sm_gmem_circles3, prev.get_v3(), curr.get_v3(), c);
     }
 }
+///
 
 /// 1 tile versions
 template <typename Op>
@@ -1371,12 +1405,12 @@ void launch_specialized_kernel(
         const uint32_t end3_j = start3_j + SM_TW;
 
         // Create flag array
-        create_flag_array<CircleOp3Tile><<<48, 32*32>>>(gmem_circles,
-            start1_i, start1_j, end1_i, end1_j,
-            start2_i, start2_j, end2_i, end2_j,
-            start3_i, start3_j, end3_i, end3_j,
-            flag
-        );
+        TileBoundsArray3 tile_bounds = {{
+            {(float)start1_j, (float)start1_i, float(end1_j-1), float(end1_i-1)},
+            {(float)start2_j, (float)start2_i, float(end2_j-1), float(end2_i-1)},
+            {(float)start3_j, (float)start3_i, float(end3_j-1), float(end3_i-1)}
+        }};
+        create_flag_array<CircleOp3Tile, 3, 2, TileBoundsArray3><<<48, 32*32>>>(gmem_circles, tile_bounds, flag);
 
         // Run scan on flag array
         scan_gpu::launch_scan<CircleOp3Tile>(gmem_circles.n_circle, flag, seed);
@@ -1442,21 +1476,32 @@ void launch_specialized_kernel(
             sm_gmem_circles_workspace + 5 * num_circles_aligned,
             sm_gmem_circles_workspace + 6 * num_circles_aligned
         };
+
         const uint32_t smt_i = sm_idx / smt_per_j;
         const uint32_t smt_j = sm_idx % smt_per_j;
         const uint32_t start_i = smt_i * SM_TH;
         const uint32_t start_j = smt_j * SM_TW;
         const uint32_t end_i = start_i + SM_TH;
         const uint32_t end_j = start_j + SM_TW;
+
+        // TileBoundsArray1 tile_bounds = {{
+        //     {(float)start_j, (float)start_i, float(end_j-1), float(end_i-1)}
+        // }};
+        // create_flag_array<CircleOp1Tile, 1, 4, TileBoundsArray1><<<48, 32*32>>>(gmem_circles, tile_bounds, flag_1Tile);
         create_flag_array<CircleOp1Tile><<<48, 32*32>>>(gmem_circles,
             start_i, start_j, end_i, end_j,
             flag_1Tile
         );
+
         scan_gpu::launch_scan<CircleOp1Tile>(gmem_circles.n_circle, flag_1Tile, seed);
+        
         extract_scan<CircleOp1Tile><<<48, 32*32>>>(gmem_circles, flag_1Tile, sm_gmem_circles);
+        
         Data1Tile last_run;
         CUDA_CHECK(cudaMemcpy(&last_run, &flag_1Tile[gmem_circles.n_circle - 1], sizeof(Data1Tile), cudaMemcpyDeviceToHost));
+        // sm_gmem_circles.n_circle = last_run.data;
         sm_gmem_circles.n_circle = last_run;
+        
         GmemCircles const_sm_gmem_circles = {
             sm_gmem_circles.n_circle,
             sm_gmem_circles.circle_x,
