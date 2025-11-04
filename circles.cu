@@ -375,19 +375,6 @@ typename Op::Data *launch_scan(
 ////////////////////////////////////////////////////////////////////////////////
 // Optimized GPU Implementation
 
-struct TileBounds {
-    float start_jf;
-    float start_if;
-    float end_jf;
-    float end_if;
-};
-struct TileBoundsArray1 {
-    TileBounds tiles[1];
-};
-struct TileBoundsArray3 {
-    TileBounds tiles[3];
-};
-
 struct __align__(8) CircleData3Tile {
     uint64_t data;
 
@@ -426,7 +413,7 @@ struct __align__(8) CircleData3Tile {
             default: break;
         }
     }
-    __host__ __device__ __forceinline__ uint32_t get_vi(uint32_t i) {
+    __host__ __device__ __forceinline__ uint32_t get_vi(uint32_t i) const {
         switch (i) {
             case 0: return get_v1(); break;
             case 1: return get_v2(); break;
@@ -459,7 +446,7 @@ struct __align__(4) CircleData1Tile {
     __host__ __device__ __forceinline__ void set_vi(uint32_t i, uint32_t v) {
         data = v;
     }
-    __host__ __device__ __forceinline__ uint32_t get_vi(uint32_t i) {
+    __host__ __device__ __forceinline__ uint32_t get_vi(uint32_t i) const {
         return data;
     }
 };
@@ -509,6 +496,24 @@ struct SmemCircles { // The difference is SMEM is modifiable
     float *circle_green;
     float *circle_blue;
     float *circle_alpha;
+};
+struct TileBounds {
+    float start_jf;
+    float start_if;
+    float end_jf;
+    float end_if;
+};
+struct TileBoundsArray1 {
+    TileBounds tiles[1];
+};
+struct TileBoundsArray3 {
+    TileBounds tiles[3];
+};
+struct SmGmemCirclesArray1 {
+    SmemCircles circles[1];
+};
+struct SmGmemCirclesArray3 {
+    SmemCircles circles[3];
 };
 
 __device__ void load_circles(
@@ -628,7 +633,6 @@ __device__ bool circle_intersects_rect(
     return (dx * dx + dy * dy) < (radius * radius);
 }
 
-/// 3 tile versions
 template <typename Op, uint32_t N, uint32_t VS, typename TileBoundsT>
 __device__ void scalar_create_flag_array(GmemCircles gmem_circles,
     TileBoundsT tile_bounds, typename Op::Data *flag_arr
@@ -654,6 +658,7 @@ __device__ void scalar_create_flag_array(GmemCircles gmem_circles,
         flag_arr[c] = result;
     }
 }
+
 template <typename Op, uint32_t N, uint32_t VS, typename TileBoundsT>
 __launch_bounds__(32*32)
 __global__ void create_flag_array(GmemCircles gmem_circles,
@@ -731,6 +736,7 @@ __global__ void create_flag_array(GmemCircles gmem_circles,
         flag_arr[c] = result;
     }
 }
+
 template <typename Op>
 __device__ void extract_scan_helper(GmemCircles gmem_circles, SmemCircles sm_gmem_circles,
     const uint32_t prev, const uint32_t curr, const uint32_t c
@@ -746,117 +752,99 @@ __device__ void extract_scan_helper(GmemCircles gmem_circles, SmemCircles sm_gme
         sm_gmem_circles.circle_alpha[curr - 1] = gmem_circles.circle_alpha[c];
     }
 }
-template <typename Op>
-__device__ void scalar_extract_scan(GmemCircles gmem_circles, typename Op::Data *flag_arr, SmemCircles sm_gmem_circles1, SmemCircles sm_gmem_circles2, SmemCircles sm_gmem_circles3) {
+
+template <typename Op, uint32_t N, uint32_t VS, typename SmGmemCirclesArrayT>
+__device__ void scalar_extract_scan(GmemCircles gmem_circles, typename Op::Data *flag_arr, SmGmemCirclesArrayT sm_gmem_circles_array) {
     using Data = typename Op::Data;
     if (blockIdx.x == 0 && threadIdx.x == 0) {
         Data curr = flag_arr[0];
-        if (curr.get_v1() == 1) {
-            // Transfer circle from grid array to sm array
-            sm_gmem_circles1.circle_x[0] = gmem_circles.circle_x[0];
-            sm_gmem_circles1.circle_y[0] = gmem_circles.circle_y[0];
-            sm_gmem_circles1.circle_radius[0] = gmem_circles.circle_radius[0];
-            sm_gmem_circles1.circle_red[0] = gmem_circles.circle_red[0];
-            sm_gmem_circles1.circle_green[0] = gmem_circles.circle_green[0];
-            sm_gmem_circles1.circle_blue[0] = gmem_circles.circle_blue[0];
-            sm_gmem_circles1.circle_alpha[0] = gmem_circles.circle_alpha[0];
-        }
-        if (curr.get_v2() == 1) {
-            sm_gmem_circles2.circle_x[0] = gmem_circles.circle_x[0];
-            sm_gmem_circles2.circle_y[0] = gmem_circles.circle_y[0];
-            sm_gmem_circles2.circle_radius[0] = gmem_circles.circle_radius[0];
-            sm_gmem_circles2.circle_red[0] = gmem_circles.circle_red[0];
-            sm_gmem_circles2.circle_green[0] = gmem_circles.circle_green[0];
-            sm_gmem_circles2.circle_blue[0] = gmem_circles.circle_blue[0];
-            sm_gmem_circles2.circle_alpha[0] = gmem_circles.circle_alpha[0];
-        }
-        if (curr.get_v3() == 1) {
-            sm_gmem_circles3.circle_x[0] = gmem_circles.circle_x[0];
-            sm_gmem_circles3.circle_y[0] = gmem_circles.circle_y[0];
-            sm_gmem_circles3.circle_radius[0] = gmem_circles.circle_radius[0];
-            sm_gmem_circles3.circle_red[0] = gmem_circles.circle_red[0];
-            sm_gmem_circles3.circle_green[0] = gmem_circles.circle_green[0];
-            sm_gmem_circles3.circle_blue[0] = gmem_circles.circle_blue[0];
-            sm_gmem_circles3.circle_alpha[0] = gmem_circles.circle_alpha[0];
+        #pragma unroll
+        for (uint32_t k = 0; k < N; ++k) {
+            if (curr.get_vi(k) == 1) {
+                // Transfer circle from grid array to sm array
+                sm_gmem_circles_array.circles[k].circle_x[0] = gmem_circles.circle_x[0];
+                sm_gmem_circles_array.circles[k].circle_y[0] = gmem_circles.circle_y[0];
+                sm_gmem_circles_array.circles[k].circle_radius[0] = gmem_circles.circle_radius[0];
+                sm_gmem_circles_array.circles[k].circle_red[0] = gmem_circles.circle_red[0];
+                sm_gmem_circles_array.circles[k].circle_green[0] = gmem_circles.circle_green[0];
+                sm_gmem_circles_array.circles[k].circle_blue[0] = gmem_circles.circle_blue[0];
+                sm_gmem_circles_array.circles[k].circle_alpha[0] = gmem_circles.circle_alpha[0];
+            }
         }
     }
     for (uint32_t c = blockIdx.x * blockDim.x + threadIdx.x + 1; c < gmem_circles.n_circle; c += gridDim.x * blockDim.x) {
         const Data prev = flag_arr[c - 1];
         const Data curr = flag_arr[c];
-        extract_scan_helper<Op>(gmem_circles, sm_gmem_circles1, prev.get_v1(), curr.get_v1(), c);
-        extract_scan_helper<Op>(gmem_circles, sm_gmem_circles2, prev.get_v2(), curr.get_v2(), c);
-        extract_scan_helper<Op>(gmem_circles, sm_gmem_circles3, prev.get_v3(), curr.get_v3(), c);
+        #pragma unroll
+        for (uint32_t k = 0; k < N; ++k) {
+            extract_scan_helper<Op>(gmem_circles, sm_gmem_circles_array.circles[k], prev.get_vi(k), curr.get_vi(k), c);
+        }
     }
 }
-template <typename Op>
+
+template <typename Op, uint32_t N, uint32_t VS, typename SmGmemCirclesArrayT>
 __launch_bounds__(32*32)
-__global__ void extract_scan(GmemCircles gmem_circles, typename Op::Data *flag_arr, SmemCircles sm_gmem_circles1, SmemCircles sm_gmem_circles2, SmemCircles sm_gmem_circles3) {
+__global__ void extract_scan(GmemCircles gmem_circles, typename Op::Data *flag_arr, SmGmemCirclesArrayT sm_gmem_circles_array) {
     // If size is less than vector size use scalar version
     if (gmem_circles.n_circle < 16) {
-        scalar_extract_scan<Op>(gmem_circles, flag_arr, sm_gmem_circles1, sm_gmem_circles2, sm_gmem_circles3);
+        scalar_extract_scan<Op, N, VS, SmGmemCirclesArrayT>(gmem_circles, flag_arr, sm_gmem_circles_array);
         return;
     }
 
     // Vectorize flag array
     using Data = typename Op::Data;
-    using VecData = Vectorized<Data, 2>;
-    VecData *flag_arr2 = reinterpret_cast<VecData*>(flag_arr);
+    using VecData = Vectorized<Data, VS>;
+    VecData *vec_flag_arr = reinterpret_cast<VecData*>(flag_arr);
 
     // Handle vectors
     if (blockIdx.x == 0 && threadIdx.x == 0) {
-        const VecData curr = flag_arr2[0];
-        if (curr.elements[0].get_v1() == 1) {
-            sm_gmem_circles1.circle_x[0] = gmem_circles.circle_x[0];
-            sm_gmem_circles1.circle_y[0] = gmem_circles.circle_y[0];
-            sm_gmem_circles1.circle_radius[0] = gmem_circles.circle_radius[0];
-            sm_gmem_circles1.circle_red[0] = gmem_circles.circle_red[0];
-            sm_gmem_circles1.circle_green[0] = gmem_circles.circle_green[0];
-            sm_gmem_circles1.circle_blue[0] = gmem_circles.circle_blue[0];
-            sm_gmem_circles1.circle_alpha[0] = gmem_circles.circle_alpha[0];
+        const VecData curr = vec_flag_arr[0];
+        #pragma unroll
+        for (uint32_t k = 0; k < N; ++k) {
+            if (curr.elements[0].get_vi(k) == 1) {
+                sm_gmem_circles_array.circles[k].circle_x[0] = gmem_circles.circle_x[0];
+                sm_gmem_circles_array.circles[k].circle_y[0] = gmem_circles.circle_y[0];
+                sm_gmem_circles_array.circles[k].circle_radius[0] = gmem_circles.circle_radius[0];
+                sm_gmem_circles_array.circles[k].circle_red[0] = gmem_circles.circle_red[0];
+                sm_gmem_circles_array.circles[k].circle_green[0] = gmem_circles.circle_green[0];
+                sm_gmem_circles_array.circles[k].circle_blue[0] = gmem_circles.circle_blue[0];
+                sm_gmem_circles_array.circles[k].circle_alpha[0] = gmem_circles.circle_alpha[0];
+            }
         }
-        if (curr.elements[0].get_v2() == 1) {
-            sm_gmem_circles2.circle_x[0] = gmem_circles.circle_x[0];
-            sm_gmem_circles2.circle_y[0] = gmem_circles.circle_y[0];
-            sm_gmem_circles2.circle_radius[0] = gmem_circles.circle_radius[0];
-            sm_gmem_circles2.circle_red[0] = gmem_circles.circle_red[0];
-            sm_gmem_circles2.circle_green[0] = gmem_circles.circle_green[0];
-            sm_gmem_circles2.circle_blue[0] = gmem_circles.circle_blue[0];
-            sm_gmem_circles2.circle_alpha[0] = gmem_circles.circle_alpha[0];
+        #pragma unroll
+        for (uint32_t j = 1; j < VS; ++j) {
+            #pragma unroll
+            for (uint32_t k = 0; k < N; ++k) {
+                extract_scan_helper<Op>(gmem_circles, sm_gmem_circles_array.circles[k], curr.elements[j-1].get_vi(k), curr.elements[j].get_vi(k), j);
+            }
         }
-        if (curr.elements[0].get_v3() == 1) {
-            sm_gmem_circles3.circle_x[0] = gmem_circles.circle_x[0];
-            sm_gmem_circles3.circle_y[0] = gmem_circles.circle_y[0];
-            sm_gmem_circles3.circle_radius[0] = gmem_circles.circle_radius[0];
-            sm_gmem_circles3.circle_red[0] = gmem_circles.circle_red[0];
-            sm_gmem_circles3.circle_green[0] = gmem_circles.circle_green[0];
-            sm_gmem_circles3.circle_blue[0] = gmem_circles.circle_blue[0];
-            sm_gmem_circles3.circle_alpha[0] = gmem_circles.circle_alpha[0];
-        }
-        extract_scan_helper<Op>(gmem_circles, sm_gmem_circles1, curr.elements[0].get_v1(), curr.elements[1].get_v1(), 1);
-        extract_scan_helper<Op>(gmem_circles, sm_gmem_circles2, curr.elements[0].get_v2(), curr.elements[1].get_v2(), 1);
-        extract_scan_helper<Op>(gmem_circles, sm_gmem_circles3, curr.elements[0].get_v3(), curr.elements[1].get_v3(), 1);
     }
-    for (uint32_t vc = blockIdx.x * blockDim.x + threadIdx.x + 1; vc < gmem_circles.n_circle / 2; vc += gridDim.x * blockDim.x) {
-        const VecData prev = flag_arr2[vc - 1];
-        const VecData curr = flag_arr2[vc];
-        extract_scan_helper<Op>(gmem_circles, sm_gmem_circles1, prev.elements[1].get_v1(), curr.elements[0].get_v1(), vc*2 + 0);
-        extract_scan_helper<Op>(gmem_circles, sm_gmem_circles1, curr.elements[0].get_v1(), curr.elements[1].get_v1(), vc*2 + 1);
-        extract_scan_helper<Op>(gmem_circles, sm_gmem_circles2, prev.elements[1].get_v2(), curr.elements[0].get_v2(), vc*2 + 0);
-        extract_scan_helper<Op>(gmem_circles, sm_gmem_circles2, curr.elements[0].get_v2(), curr.elements[1].get_v2(), vc*2 + 1);
-        extract_scan_helper<Op>(gmem_circles, sm_gmem_circles3, prev.elements[1].get_v3(), curr.elements[0].get_v3(), vc*2 + 0);
-        extract_scan_helper<Op>(gmem_circles, sm_gmem_circles3, curr.elements[0].get_v3(), curr.elements[1].get_v3(), vc*2 + 1);
+    for (uint32_t vc = blockIdx.x * blockDim.x + threadIdx.x + 1; vc < gmem_circles.n_circle / VS; vc += gridDim.x * blockDim.x) {
+        const VecData prev = vec_flag_arr[vc - 1];
+        const VecData curr = vec_flag_arr[vc];
+        #pragma unroll
+        for (uint32_t k = 0; k < N; ++k) {
+            extract_scan_helper<Op>(gmem_circles, sm_gmem_circles_array.circles[k], prev.elements[VS-1].get_vi(k), curr.elements[0].get_vi(k), vc*VS + 0);
+        }
+        #pragma unroll
+        for (uint32_t j = 1; j < VS; ++j) {
+            #pragma unroll
+            for (uint32_t k = 0; k < N; ++k) {
+                extract_scan_helper<Op>(gmem_circles, sm_gmem_circles_array.circles[k], curr.elements[j-1].get_vi(k), curr.elements[j].get_vi(k), vc*VS + j);
+            }
+        }
     }
 
     // Handle tail
-    for (uint32_t c = (gmem_circles.n_circle / 2) * 2 + (blockIdx.x * blockDim.x + threadIdx.x); c < gmem_circles.n_circle; c += gridDim.x * blockDim.x) {
+    for (uint32_t c = (gmem_circles.n_circle / VS) * VS + (blockIdx.x * blockDim.x + threadIdx.x); c < gmem_circles.n_circle; c += gridDim.x * blockDim.x) {
         const Data prev = flag_arr[c - 1];
         const Data curr = flag_arr[c];
-        extract_scan_helper<Op>(gmem_circles, sm_gmem_circles1, prev.get_v1(), curr.get_v1(), c);
-        extract_scan_helper<Op>(gmem_circles, sm_gmem_circles2, prev.get_v2(), curr.get_v2(), c);
-        extract_scan_helper<Op>(gmem_circles, sm_gmem_circles3, prev.get_v3(), curr.get_v3(), c);
+        #pragma unroll
+        for (uint32_t k = 0; k < N; ++k) {
+            extract_scan_helper<Op>(gmem_circles, sm_gmem_circles_array.circles[k], prev.get_vi(k), curr.get_vi(k), c);
+        }
     }
 }
-///
 
 /// 1 tile versions
 template <typename Op>
@@ -1416,7 +1404,10 @@ void launch_specialized_kernel(
         scan_gpu::launch_scan<CircleOp3Tile>(gmem_circles.n_circle, flag, seed);
 
         // Extract scan
-        extract_scan<CircleOp3Tile><<<48, 32*32>>>(gmem_circles, flag, sm_gmem_circles1, sm_gmem_circles2, sm_gmem_circles3);
+        SmGmemCirclesArray3 sm_gmem_circles_array = {{
+            sm_gmem_circles1, sm_gmem_circles2, sm_gmem_circles3
+        }};
+        extract_scan<CircleOp3Tile, 3, 2, SmGmemCirclesArray3><<<48, 32*32>>>(gmem_circles, flag, sm_gmem_circles_array);
 
         // Set n_circle
         Data last_run;
