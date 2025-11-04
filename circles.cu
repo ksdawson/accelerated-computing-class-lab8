@@ -1239,11 +1239,11 @@ void launch_specialized_kernel(
     GpuMemoryPool &memory_pool
 ) {
     // Tile info
-    using Data = typename CircleOp7Tile::Data;
-    using SmGmemCirclesArray = SmGmemCirclesArray7;
-    using TileBoundsArray = TileBoundsArray7;
-    using CircleOp = CircleOp7Tile;
-    constexpr uint32_t N = 7;
+    using Data = typename CircleOp3Tile::Data;
+    using SmGmemCirclesArray = SmGmemCirclesArray3;
+    using TileBoundsArray = TileBoundsArray3;
+    using CircleOp = CircleOp3Tile;
+    constexpr uint32_t N = 3;
     constexpr uint32_t VS = 16 / sizeof(Data);
 
     // For each tile run a scan using the full grid to get the circles actually in the tile (takes ~75ms)
@@ -1301,7 +1301,7 @@ void launch_specialized_kernel(
         }
 
         // Create flag array
-        create_flag_array<CircleOp7Tile, N, VS, TileBoundsArray7><<<48, 32*32>>>(gmem_circles, tile_bounds, flag);
+        create_flag_array<CircleOp, N, VS, TileBoundsArray><<<48, 32*32>>>(gmem_circles, tile_bounds, flag);
 
         // Run scan on flag array
         scan_gpu::launch_scan<CircleOp>(gmem_circles.n_circle, flag, seed);
